@@ -419,12 +419,34 @@ class ProjImgTrans:
         inpainted = None
         mp = self.get_inpainted_path(imgname, get_last_modified=True)
         if mp is not None and osp.exists(mp):
-            inpainted = imread(mp)
+            # Retry logic for reading potentially locked/incomplete files
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    inpainted = imread(mp)
+                    break # Success
+                except (OSError, AttributeError, Exception) as e:
+                    if attempt < max_retries - 1:
+                        import time
+                        LOGGER.warning(f"Failed to read inpainted image {mp} (attempt {attempt+1}): {e}. Retrying...")
+                        time.sleep(0.5) # Wait for write to finish
+                    else:
+                        LOGGER.error(f"Permanently failed to read inpainted image {mp}: {e}")
+                        return None
+
             if imgname == self.current_img and self.img_array is not None:
                 h, w = self.img_array.shape[:2]
             else:
-                i = Image.open(osp.join(self.directory, imgname))
-                h, w = i.height, i.width
+                try:
+                    i = Image.open(osp.join(self.directory, imgname))
+                    h, w = i.height, i.width
+                except:
+                    # Fallback if original image read fails
+                    if inpainted is not None:
+                        h, w = inpainted.shape[:2]
+                    else:
+                        return None
+
             ih, iw = inpainted.shape[:2]
             if ih != h or iw != w:
                 inpainted = Image.fromarray(inpainted).resize((w, h), resample=Image.Resampling.LANCZOS)

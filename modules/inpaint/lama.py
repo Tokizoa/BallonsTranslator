@@ -354,12 +354,8 @@ class LamaFourier:
             }
 
     def load_masked_position_encoding(self, mask):
+        # Optimized: replaces O(distance) while loop with single cv2.distanceTransform call
         mask = (mask * 255).astype(np.uint8)
-        ones_filter = np.ones((3, 3), dtype=np.float32)
-        d_filter1 = np.array([[1, 1, 0], [1, 1, 0], [0, 0, 0]], dtype=np.float32)
-        d_filter2 = np.array([[0, 0, 0], [1, 1, 0], [1, 1, 0]], dtype=np.float32)
-        d_filter3 = np.array([[0, 1, 1], [0, 1, 1], [0, 0, 0]], dtype=np.float32)
-        d_filter4 = np.array([[0, 0, 0], [0, 1, 1], [0, 1, 1]], dtype=np.float32)
         str_size = 256
         pos_num = 128
 
@@ -369,43 +365,42 @@ class LamaFourier:
         mask = cv2.resize(mask, (str_size, str_size), interpolation=cv2.INTER_AREA)
         mask[mask > 0] = 255
         h, w = mask.shape[0:2]
-        mask3 = mask.copy()
-        mask3 = 1. - (mask3 / 255.0)
+
         pos = np.zeros((h, w), dtype=np.int32)
         direct = np.zeros((h, w, 4), dtype=np.int32)
-        i = 0
 
-        if mask3.max() > 0:
-            # otherwise it will cause infinity loop
-        
-            while np.sum(1 - mask3) > 0:
-                i += 1
-                mask3_ = cv2.filter2D(mask3, -1, ones_filter)
-                mask3_[mask3_ > 0] = 1
-                sub_mask = mask3_ - mask3
-                pos[sub_mask == 1] = i
+        # mask: 255 = unknown (to inpaint), 0 = known
+        has_unknown = mask.max() > 0
+        has_known = np.any(mask == 0)
 
-                m = cv2.filter2D(mask3, -1, d_filter1)
-                m[m > 0] = 1
-                m = m - mask3
-                direct[m == 1, 0] = 1
+        if has_unknown and has_known:
+            # Chessboard distance from each unknown pixel to nearest known pixel
+            # Equivalent to the original iterative BFS with 3x3 ones dilation kernel
+            dist = cv2.distanceTransform(mask, cv2.DIST_C, 3)
+            pos = dist.astype(np.int32)
 
-                m = cv2.filter2D(mask3, -1, d_filter2)
-                m[m > 0] = 1
-                m = m - mask3
-                direct[m == 1, 1] = 1
+            # Compute directional info from distance field neighbor analysis
+            # For each quadrant, check if any neighbor has strictly lower distance
+            # This is equivalent to the original directional dilation filters
+            INF = int(pos.max()) + 1
+            pos_pad = np.pad(pos, 1, mode='constant', constant_values=INF)
+            unknown = pos > 0
 
-                m = cv2.filter2D(mask3, -1, d_filter3)
-                m[m > 0] = 1
-                m = m - mask3
-                direct[m == 1, 2] = 1
+            # d_filter1: top-left neighbors (-1,-1), (-1,0), (0,-1)
+            min_d1 = np.minimum(np.minimum(pos_pad[:-2, :-2], pos_pad[:-2, 1:-1]), pos_pad[1:-1, :-2])
+            direct[..., 0] = ((min_d1 < pos) & unknown).astype(np.int32)
 
-                m = cv2.filter2D(mask3, -1, d_filter4)
-                m[m > 0] = 1
-                m = m - mask3
-                direct[m == 1, 3] = 1
+            # d_filter2: bottom-left neighbors (0,-1), (1,-1), (1,0)
+            min_d2 = np.minimum(np.minimum(pos_pad[1:-1, :-2], pos_pad[2:, :-2]), pos_pad[2:, 1:-1])
+            direct[..., 1] = ((min_d2 < pos) & unknown).astype(np.int32)
 
-                mask3 = mask3_
+            # d_filter3: top-right neighbors (-1,0), (-1,1), (0,1)
+            min_d3 = np.minimum(np.minimum(pos_pad[:-2, 1:-1], pos_pad[:-2, 2:]), pos_pad[1:-1, 2:])
+            direct[..., 2] = ((min_d3 < pos) & unknown).astype(np.int32)
+
+            # d_filter4: bottom-right neighbors (0,1), (1,0), (1,1)
+            min_d4 = np.minimum(np.minimum(pos_pad[1:-1, 2:], pos_pad[2:, 1:-1]), pos_pad[2:, 2:])
+            direct[..., 3] = ((min_d4 < pos) & unknown).astype(np.int32)
 
         abs_pos = pos.copy()
         rel_pos = pos / (str_size / 2)  # to 0~1 maybe larger than 1

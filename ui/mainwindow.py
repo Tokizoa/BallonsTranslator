@@ -1372,12 +1372,21 @@ class MainWindow(mainwindow_cls):
             self.st_manager.auto_textlayout_flag = pcfg.let_autolayout_flag and \
                 (pcfg.module.enable_detect or pcfg.module.enable_translate)
         
-        if page_index != self.pageList.currentIndex().row():
+        # CRITICAL FIX for parallel translation:
+        # Always switch to the completed page, update scene, and save
+        # This ensures result images are saved with translations
+        needs_switch = page_index != self.pageList.currentIndex().row()
+        
+        # Always set current page and update scene for the completed page
+        self.imgtrans_proj.set_current_img_byidx(page_index)
+        self.canvas.updateCanvas()
+        self.st_manager.updateSceneTextitems()
+        
+        # Update page list selection if needed (without triggering page change event)
+        if needs_switch:
+            self.pageList.blockSignals(True)
             self.pageList.setCurrentRow(page_index)
-        else:
-            self.imgtrans_proj.set_current_img_byidx(page_index)
-            self.canvas.updateCanvas()
-            self.st_manager.updateSceneTextitems()
+            self.pageList.blockSignals(False)
 
         if not pcfg.module.enable_detect and pcfg.module.enable_translate:
             for blkitem in self.st_manager.textblk_item_list:
@@ -1673,7 +1682,8 @@ class MainWindow(mainwindow_cls):
     def ocr_postprocess(self, textblocks: List[TextBlock], img, ocr_module=None, **kwargs):
         for blk in textblocks:
             text = blk.get_text()
-            blk.text = self.ocrSubWidget.sub_text(text)
+            new_text = self.ocrSubWidget.sub_text(text)
+            blk.text = new_text
 
         # 字体检测：在 OCR 完成后按配置执行（按需导入以减少启动开销）
         try:

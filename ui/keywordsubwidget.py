@@ -122,8 +122,13 @@ class KeywordSubWidget(QDialog):
                 flag |= re.IGNORECASE
             if not subpair['use_reg']:
                 regexr = re.escape(regexr)
+                # Use lambda to treat replacement string as literal text
+                repl = lambda m, s=subpair['sub']: s
+            else:
+                repl = subpair['sub']
+
             try: 
-                text = re.sub(regexr, subpair['sub'], text)
+                text = re.sub(regexr, repl, text, flags=flag)
             except Exception as e:
                 LOGGER.error(f'Invalid regex expression {regexr} at {ii+1}:')
                 LOGGER.error(traceback.format_exc())

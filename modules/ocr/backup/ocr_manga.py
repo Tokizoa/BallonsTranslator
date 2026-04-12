@@ -1,7 +1,7 @@
 # modified from https://github.com/kha-white/manga-ocr/blob/master/manga_ocr/ocr.py
 import re
 import jaconv
-from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
+from transformers import AutoFeatureExtractor, AutoTokenizer, VisionEncoderDecoderModel
 import numpy as np
 import torch
 from typing import List
@@ -11,7 +11,7 @@ from .base import OCRBase, register_OCR, DEFAULT_DEVICE, DEVICE_SELECTOR, TextBl
 MANGA_OCR_PATH = r'data/models/manga-ocr-base-2025'
 class MangaOcr:
     def __init__(self, pretrained_model_name_or_path=MANGA_OCR_PATH, device='cpu'):
-        self.image_processor = AutoImageProcessor.from_pretrained(pretrained_model_name_or_path)
+        self.feature_extractor = AutoFeatureExtractor.from_pretrained(pretrained_model_name_or_path)
         self.tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path)
         self.model = VisionEncoderDecoderModel.from_pretrained(pretrained_model_name_or_path)
         self.to(device)
@@ -21,7 +21,7 @@ class MangaOcr:
 
     @torch.no_grad()
     def __call__(self, img: np.ndarray):
-        x = self.image_processor(img, return_tensors="pt").pixel_values.squeeze()
+        x = self.feature_extractor(img, return_tensors="pt").pixel_values.squeeze()
         x = self.model.generate(x[None].to(self.model.device))[0].cpu()
         x = self.tokenizer.decode(x, skip_special_tokens=True)
         x = post_process(x)
@@ -80,7 +80,7 @@ class MangaOCR(OCRBase):
                 blk.text = self.model(region)
             else:
                 self.logger.warning('invalid textbbox to target img')
-                blk.text = ''
+                blk.text = ['']
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
