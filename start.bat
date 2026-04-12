@@ -1,6 +1,6 @@
 @echo off
 :: 1. Scripts 폴더로 이동 (경로에 공백이 있으므로 따옴표 필수)
-cd /d "E:\Downloads\hitomi downloader\BallonsTranslator-latest\Scripts"
+cd /d "E:\Downloads\hitomi downloader\BallonsTranslator\Scripts"
 
 :: 2. 가상 환경 활성화 (call 명령어를 써야 가상환경 실행 후 다음 줄로 넘어갑니다)
 call activate.bat
