@@ -22,6 +22,7 @@ tmp.py
 dummy_scripts.py
 scripts
 
+
 alphabet-all-*
 *gitpython
 PortableGit
@@ -52,6 +53,7 @@ pip
 *.aff
 *.exc
 *.md
+*.svg
 
 fonts/*
 !fonts/put fonts here.txt
