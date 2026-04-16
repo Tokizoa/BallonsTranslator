@@ -20,7 +20,8 @@ _V4_GUI_LAYOUT_ENABLED = True
 _V4_REPAIR_MODE = False
 _V4_LAYOUT_START_TIME = 0.0  # Layout start timestamp for elapsed time tracking
 _V4_LAYOUT_COMPLETED_COUNT = 0  # Completed page count for layout progress
-_V4_REPAIR_PAGES = None  # Set[str] of page keys to process during repair, None = all pages
+_V4_REPAIR_PAGES = None      # Set[str] of page keys to process during repair, None = all pages
+_V4_REPAIR_OCR_PAGES = None  # Set[str] of page keys where OCR is also needed (both src+trans empty)
 
 # Watchdog: heartbeat updated by save workers; a monitor thread dumps all
 # thread stacks when no progress for too long. Diagnostic only - no recovery.
@@ -1191,18 +1192,21 @@ def _install_patches():
                     _MainWindow._original_on_run_imgtrans_v4_repair = _MainWindow.on_run_imgtrans
 
                     def _patched_on_run_imgtrans(self, continue_mode=False, repair_mode=False):
-                        global _V4_REPAIR_MODE, _V4_REPAIR_PAGES
+                        global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES
                         if not repair_mode:
                             # Delegate to the original (or previously patched) version
                             return self._original_on_run_imgtrans_v4_repair(continue_mode=continue_mode)
 
                         # --- Repair Mode ---
-                        # Find all blocks whose translation contains "error" OR is empty (with source text present).
-                        if LOGGER: LOGGER.info("Repair mode: scanning for error/empty translations...")
+                        # Find all blocks whose translation contains "error",
+                        # is empty with source present, or has both source AND translation empty.
+                        if LOGGER: LOGGER.info("Repair mode: scanning for error/empty/blank translations...")
 
                         pages_to_repair = []
+                        pages_needing_ocr = set()  # Pages where at least one block needs OCR
                         error_count = 0
                         empty_count = 0
+                        blank_count = 0  # Both source AND translation are empty
                         for page_name, blk_list in self.imgtrans_proj.pages.items():
                             page_needs_repair = False
                             for blk in blk_list:
@@ -1213,37 +1217,51 @@ def _install_patches():
                                     joined_source = ' '.join(s for s in source_text if isinstance(s, str)).strip()
                                 else:
                                     joined_source = str(source_text).strip() if source_text else ''
-                                # Skip blocks with empty OCR or OCR containing 'error'
                                 has_source = bool(joined_source) and 'error' not in joined_source.lower()
+                                has_trans = bool(trans) and (isinstance(trans, str) and trans.strip())
 
                                 needs_repair = False
+                                needs_ocr = False
                                 if isinstance(trans, str) and 'error' in trans.lower():
                                     needs_repair = True
                                     error_count += 1
-                                elif has_source and (not trans or (isinstance(trans, str) and not trans.strip())):
+                                elif has_source and not has_trans:
+                                    # Has OCR text but no translation
                                     needs_repair = True
                                     empty_count += 1
+                                elif not has_source and not has_trans:
+                                    # Both source and translation are empty → need OCR + translation
+                                    needs_repair = True
+                                    needs_ocr = True
+                                    blank_count += 1
 
                                 if needs_repair:
                                     blk.translation = ''
                                     blk.rich_text = ''
                                     blk._v4_needs_repair = True
+                                    if needs_ocr:
+                                        blk._v4_needs_ocr = True
+                                        pages_needing_ocr.add(page_name)
                                     page_needs_repair = True
                             if page_needs_repair:
                                 pages_to_repair.append(page_name)
 
-                        total_count = error_count + empty_count
+                        total_count = error_count + empty_count + blank_count
                         if total_count == 0:
-                            if LOGGER: LOGGER.info("Repair mode: no errors or empty translations found, nothing to do.")
+                            if LOGGER: LOGGER.info("Repair mode: no errors or empty/blank translations found, nothing to do.")
                             from utils.message import create_info_dialog
-                            create_info_dialog("No translation errors or empty translations found. Nothing to repair.")
+                            create_info_dialog("No translation errors or empty/blank translations found. Nothing to repair.")
                             return
 
-                        if LOGGER: LOGGER.info(f"Repair mode: found {error_count} error + {empty_count} empty blocks across {len(pages_to_repair)} pages. Starting re-translation...")
+                        if LOGGER: LOGGER.info(f"Repair mode: found {error_count} error + {empty_count} empty + {blank_count} blank blocks across {len(pages_to_repair)} pages. Starting re-translation...")
+                        has_ocr_pages = bool(pages_needing_ocr)
+                        if has_ocr_pages:
+                            if LOGGER: LOGGER.info(f"Repair mode: {len(pages_needing_ocr)} pages need OCR (both src+trans empty)")
 
                         # Activate repair mode filter
                         _V4_REPAIR_MODE = True
                         _V4_REPAIR_PAGES = set(pages_to_repair)
+                        _V4_REPAIR_OCR_PAGES = pages_needing_ocr if has_ocr_pages else None
 
                         # Save original settings to restore later
                         _orig_detect = pcfg.module.enable_detect
@@ -1251,9 +1269,9 @@ def _install_patches():
                         _orig_inpaint = pcfg.module.enable_inpaint
                         _orig_translate = pcfg.module.enable_translate
 
-                        # Enable only translate
+                        # Enable translate; enable OCR only if there are blank blocks needing it
                         pcfg.module.enable_detect = False
-                        pcfg.module.enable_ocr = False
+                        pcfg.module.enable_ocr = has_ocr_pages  # Conditionally enable OCR
                         pcfg.module.enable_inpaint = False
                         pcfg.module.enable_translate = True
 
@@ -1273,9 +1291,10 @@ def _install_patches():
 
                         # Define a restore callback
                         def _restore_settings():
-                            global _V4_REPAIR_MODE, _V4_REPAIR_PAGES
+                            global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES
                             _V4_REPAIR_MODE = False
                             _V4_REPAIR_PAGES = None
+                            _V4_REPAIR_OCR_PAGES = None
                             pcfg.module.enable_detect = _orig_detect
                             pcfg.module.enable_ocr = _orig_ocr
                             pcfg.module.enable_inpaint = _orig_inpaint
@@ -2148,8 +2167,11 @@ class LLM_API_Translator_V4(BaseTranslator):
             if not isinstance(text, str):
                 text = str(text) if text is not None else ""
             
-            # Check for error markers (case-insensitive)
-            if 'error:' not in text.lower():
+            # Check for empty text to prevent LLM hallucinations
+            if not text.strip():
+                if LOGGER: LOGGER.info(f"Skipping translation for block with empty source text.")
+                continue
+            elif 'error:' not in text.lower():
                 filtered_list.append(blk)
             else:
                  if LOGGER: LOGGER.info(f"Skipping translation for block with error: '{text[:20]}...'")
@@ -2165,6 +2187,10 @@ class LLM_API_Translator_V4(BaseTranslator):
             for blk in filtered_list:
                 try:
                     del blk._v4_needs_repair
+                except AttributeError:
+                    pass
+                try:
+                    del blk._v4_needs_ocr
                 except AttributeError:
                     pass
         
@@ -4619,9 +4645,33 @@ def _run_translate_pipeline_patched(self):
                             current_time = time.time()
                             if self.finished_counter == 1 or current_time - last_save_time >= save_interval:
                                 if completed_pages:
-                                    self.imgtrans_proj.save()
-                                    completed_pages.clear()
-                                    last_save_time = current_time
+                                    # [버그 수정] OCR 완료 확인 후 저장
+                                    # 병렬 OCR 워커가 아직 blk.text를 쓰는 중인 페이지가
+                                    # 빈 상태로 저장되는 경쟁 조건을 방지한다.
+                                    # RunStatus.FIN_OCR 플래그는 run_ocr_step()이
+                                    # update_page_progress(imgname, RunStatus.FIN_OCR)를
+                                    # 호출한 직후 세팅되므로, 이 플래그가 있는 페이지는
+                                    # blk.text가 이미 확정된 상태임이 보장된다.
+                                    if RunStatus is not None:
+                                        ocr_ready = [
+                                            pk for pk in completed_pages
+                                            if self.imgtrans_proj._image_info.get(pk, {}).get('finish_code', 0)
+                                               & RunStatus.FIN_OCR
+                                        ]
+                                        not_ready = len(completed_pages) - len(ocr_ready)
+                                        if not_ready > 0 and LOGGER:
+                                            LOGGER.debug(
+                                                f"Save deferred: {not_ready} page(s) waiting for OCR completion"
+                                            )
+                                        if ocr_ready:
+                                            self.imgtrans_proj.save()
+                                            completed_pages.clear()
+                                            last_save_time = current_time
+                                    else:
+                                        # RunStatus를 사용할 수 없는 환경 → 기존 동작 유지
+                                        self.imgtrans_proj.save()
+                                        completed_pages.clear()
+                                        last_save_time = current_time
                     else:
                         if local_completed_count < target_num_pages:
                             self.finished_counter += 1

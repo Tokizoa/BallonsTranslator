@@ -1711,7 +1711,29 @@ class LLM_OCR_V4(OCRBase):
     def _ocr_blk_list(self, img: np.ndarray, blk_list: List[TextBlock], *args, **kwargs):
         im_h, im_w = img.shape[:2]
 
+        # [Repair OCR Filter] In repair mode, only process blocks that explicitly need OCR
+        # (i.e., blocks where both source text AND translation were empty).
+        # Blocks that already had source text but missing translation do NOT need OCR.
+        try:
+            import sys
+            _trans_mod = sys.modules.get('modules.translators.trans_llm_api_v4')
+            _repair_mode = getattr(_trans_mod, '_V4_REPAIR_MODE', False) if _trans_mod else False
+            if _repair_mode:
+                ocr_needed = [b for b in blk_list if getattr(b, '_v4_needs_ocr', False)]
+                skipped_ocr = len(blk_list) - len(ocr_needed)
+                if self.logger:
+                    self.logger.info(
+                        f"[Repair OCR filter] {len(ocr_needed)}/{len(blk_list)} blocks need OCR "
+                        f"({skipped_ocr} already have source text, skipping)"
+                    )
+                if not ocr_needed:
+                    return
+                blk_list = ocr_needed
+        except Exception:
+            pass
+
         # MangaOCR 로컬 전용 모드: 다중 인스턴스 병렬 처리
+
         if self.use_manga_ocr_local:
             self._ensure_manga_ocr_pool()
             num_workers = self._manga_ocr_pool_size
@@ -2194,10 +2216,30 @@ def _apply_chunked_processing_patch():
                         if debug_prof:
                             _phase_enter('ocr')
                             _ocr_t0 = time.perf_counter()
+
+                        # [Repair OCR Guard] Before calling run_ocr (which resets blk.text=[]),
+                        # backup text of blocks that DON'T need OCR so we can restore them after.
+                        _ocr_text_backup = {}
+                        try:
+                            import sys as _sys
+                            _tm = _sys.modules.get('modules.translators.trans_llm_api_v4')
+                            if _tm and getattr(_tm, '_V4_REPAIR_MODE', False):
+                                for _blk in blk_list_ocr:
+                                    if not getattr(_blk, '_v4_needs_ocr', False):
+                                        _ocr_text_backup[id(_blk)] = (_blk, getattr(_blk, 'text', []))
+                        except Exception:
+                            pass
+
                         self.ocr.run_ocr(img_ocr, blk_list_ocr)
+
+                        # Restore text for blocks that didn't need OCR
+                        for _blk_id, (_blk, _saved_text) in _ocr_text_backup.items():
+                            _blk.text = _saved_text
+
                         if debug_prof:
                             prof_ocr_dur = time.perf_counter() - _ocr_t0
                             _phase_exit('ocr')
+
 
                         # === PARALLEL DEBUG LOG: End time ===
                         ocr_end_time = time.strftime("%H:%M:%S", time.localtime())
