@@ -206,11 +206,28 @@ def _install_patches():
 
                             tmp_save_tgt = self.proj_path + '.tmp'
                             try:
-                                data_dict = self.to_dict()
-                                # [메모리 강화] json.dump 스트리밍으로 메모리 절약
+                                # [메모리 강화] json.dump 딕셔너리 분할 직렬화 (메모리 단편화 원천 방지)
                                 with open(tmp_save_tgt, "w", encoding="utf-8") as f:
-                                    json.dump(data_dict, f, ensure_ascii=False, cls=TextBlkEncoder)
-                                del data_dict
+                                    f.write('{')
+                                    f.write('"directory": ' + json.dumps(self.directory, ensure_ascii=False) + ', ')
+                                    f.write('"current_img": ' + json.dumps(self.current_img, ensure_ascii=False) + ', ')
+                                    f.write('"image_info": ' + json.dumps(self._image_info, ensure_ascii=False, cls=TextBlkEncoder) + ', ')
+                                    
+                                    f.write('"pages": {')
+                                    _all_pages = self.pages.copy()
+                                    _all_pages.update(self.not_found_pages)
+                                    
+                                    _first_page = True
+                                    for _p_key, _blk_list in _all_pages.items():
+                                        if not _first_page:
+                                            f.write(', ')
+                                        _first_page = False
+                                        f.write(json.dumps(_p_key, ensure_ascii=False) + ': ')
+                                        # Dump only a single page to the disk buffer explicitly
+                                        json.dump(_blk_list, f, ensure_ascii=False, cls=TextBlkEncoder)
+                                    
+                                    f.write('}}')
+                                
                                 gc.collect()
                             except MemoryError:
                                 if LOGGER: LOGGER.error(f"MemoryError while saving project to {self.proj_path}. Project data may be too large. Existing save file preserved.")
@@ -392,6 +409,7 @@ def _install_patches():
                                 downscale_constraint = 0.6
                                 # Safe max calculation
                                 max_wl = max(wl_list) if wl_list else 1
+                                max_wl = max_wl or 1  # Guard: prevent ZeroDivisionError when all word lengths are 0
                                 resize_ratio = np.clip(min(area_ratio / ballon_area_thresh, region_rect[2] / max_wl), downscale_constraint, 1.0)
                                 if LOGGER: LOGGER.info(f"AutoLayout: Adaptive Resize (Vertical->Horizontal) Ratio={resize_ratio:.2f}")
 
@@ -399,6 +417,7 @@ def _install_patches():
                                 # [MODIFIED] Width Constraint Logic
                                 # Safe max calculation
                                 max_wl = max(wl_list) if wl_list else 1
+                                max_wl = max_wl or 1  # Guard: prevent ZeroDivisionError when all word lengths are 0
                                 width_ratio = region_rect[2] / max_wl
                                 if not src_is_cjk:
                                     resize_ratio_ballon = max(ballon_area / 1.2 / text_area, 0.7)

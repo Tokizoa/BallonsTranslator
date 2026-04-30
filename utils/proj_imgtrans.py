@@ -360,6 +360,9 @@ class ProjImgTrans:
             raise ImgnameNotInProjectException
         img_path = osp.join(self.directory, imgname)
         img = imread(img_path)
+        if img is None:
+            LOGGER.warning(f'Skipping corrupted/unreadable image: {img_path}')
+            return None
         h, w = img.shape[:2]
         self._image_info[imgname].update({'width': w, 'height': h})
         return img
