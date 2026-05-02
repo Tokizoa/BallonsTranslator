@@ -644,6 +644,8 @@ class MainWindow(mainwindow_cls):
         self.titleBar.exporttstyle_trigger.connect(self.export_tstyles)
         self.titleBar.darkmode_trigger.connect(self.on_darkmode_triggered)
         self.titleBar.merge_tool_trigger.connect(self.on_open_merge_tool)
+        self.titleBar.flatten_folder_trigger.connect(self.on_flatten_folders)
+        self.titleBar.restore_folder_trigger.connect(self.on_restore_folders)
 
         shortcutA = QShortcut(QKeySequence("A"), self)
         shortcutA.activated.connect(self.shortcutBefore)
@@ -991,6 +993,103 @@ class MainWindow(mainwindow_cls):
         # 显示结果
         total = success_count + fail_count
         QMessageBox.information(self, "完成", f"区域合并完成\n成功: {success_count}/{total}\n失败: {fail_count}/{total}")
+
+    def on_flatten_folders(self):
+        """하위 폴더 병합 실행"""
+        from qtpy.QtWidgets import QMessageBox
+        from pathlib import Path
+        from utils.folder_merge_restore import flatten_directories
+
+        if self.imgtrans_proj.directory is None:
+            QMessageBox.warning(self, "경고", "먼저 프로젝트 폴더를 열어주세요.")
+            return
+
+        directory = self.imgtrans_proj.directory
+        root_path = Path(directory)
+
+        # 하위 폴더 개수 확인
+        subdirs = [d for d in root_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
+        if not subdirs:
+            QMessageBox.information(self, "알림", "처리할 하위 폴더가 없습니다.")
+            return
+
+        ret = QMessageBox.question(
+            self, "하위 폴더 병합",
+            f"{len(subdirs)}개 하위 폴더의 파일을 상위로 병합합니다.\n"
+            f"파일명은 『폴더명』파일명 형식으로 변경됩니다.\n\n"
+            f"계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        logs = []
+        try:
+            flatten_directories(root_path, lambda msg: logs.append(msg))
+        except Exception as e:
+            logs.append(f"오류 발생: {e}")
+
+        # 프로젝트 다시 로드하여 페이지 목록 갱신
+        try:
+            self.openDir(directory)
+        except Exception:
+            pass
+
+        # 결과 표시
+        msg = QMessageBox(self)
+        msg.setWindowTitle("하위 폴더 병합 완료")
+        msg.setText("하위 폴더 병합 작업이 완료되었습니다.")
+        msg.setDetailedText("\n".join(logs))
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec_()
+
+    def on_restore_folders(self):
+        """하위 폴더 복원 (후처리 + 복원) 실행"""
+        from qtpy.QtWidgets import QMessageBox
+        from pathlib import Path
+        from utils.folder_merge_restore import post_process_and_restore
+
+        if self.imgtrans_proj.directory is None:
+            QMessageBox.warning(self, "경고", "먼저 프로젝트 폴더를 열어주세요.")
+            return
+
+        directory = self.imgtrans_proj.directory
+        root_path = Path(directory)
+
+        ret = QMessageBox.question(
+            self, "하위 폴더 복원",
+            f"다음 작업을 순서대로 수행합니다:\n\n"
+            f"1단계 (후처리):\n"
+            f"  - result 폴더 내용을 상위로 이동\n"
+            f"  - inpainted, mask, result 폴더 삭제\n"
+            f"  - JSON 파일 삭제\n\n"
+            f"2단계 (복원):\n"
+            f"  - 『폴더명』파일명 형식의 파일을 원래 폴더로 이동\n\n"
+            f"계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if ret != QMessageBox.StandardButton.Yes:
+            return
+
+        logs = []
+        try:
+            post_process_and_restore(root_path, lambda msg: logs.append(msg))
+        except Exception as e:
+            logs.append(f"오류 발생: {e}")
+
+        # 프로젝트 다시 로드하여 페이지 목록 갱신
+        try:
+            self.openDir(directory)
+        except Exception:
+            pass
+
+        # 결과 표시
+        msg = QMessageBox(self)
+        msg.setWindowTitle("하위 폴더 복원 완료")
+        msg.setText("하위 폴더 복원 작업이 완료되었습니다.")
+        msg.setDetailedText("\n".join(logs))
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.exec_()
 
     def on_req_update_pagetext(self):
         if self.canvas.text_change_unsaved():

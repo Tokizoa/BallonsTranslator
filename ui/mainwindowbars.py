@@ -376,9 +376,20 @@ class TitleBar(Widget):
         mergeToolAction = QAction('区域合并工具', self)
         mergeToolAction.setShortcut(QKeySequence('Ctrl+Shift+M'))
         self.merge_tool_trigger = mergeToolAction.triggered
+
+        # 하위 폴더 병합
+        flattenFolderAction = QAction(self.tr('하위 폴더 병합'), self)
+        self.flatten_folder_trigger = flattenFolderAction.triggered
+
+        # 하위 폴더 복원
+        restoreFolderAction = QAction(self.tr('하위 폴더 복원'), self)
+        self.restore_folder_trigger = restoreFolderAction.triggered
         
         toolsMenu = QMenu(self.toolsToolBtn)
         toolsMenu.addAction(mergeToolAction)
+        toolsMenu.addSeparator()
+        toolsMenu.addAction(flattenFolderAction)
+        toolsMenu.addAction(restoreFolderAction)
         self.toolsToolBtn.setMenu(toolsMenu)
         self.toolsToolBtn.setPopupMode(QToolButton.InstantPopup)
 
