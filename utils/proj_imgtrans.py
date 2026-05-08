@@ -272,6 +272,11 @@ class ProjImgTrans:
             img_path = self.current_img_path()
             mask_path = self.get_mask_path(get_last_modified=True)
             self.img_array = imread(img_path)
+            if self.img_array is None:
+                LOGGER.warning(f'Skipping corrupted/unreadable image in set_current_img: {img_path}')
+                self.mask_array = None
+                self.inpainted_array = None
+                return
             im_h, im_w = self.img_array.shape[:2]
             if osp.exists(mask_path):
                 self.mask_array = imread(mask_path, cv2.IMREAD_GRAYSCALE)

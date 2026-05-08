@@ -998,7 +998,6 @@ class MainWindow(mainwindow_cls):
         """하위 폴더 병합 실행"""
         from qtpy.QtWidgets import QMessageBox
         from pathlib import Path
-        from utils.folder_merge_restore import flatten_directories
 
         if self.imgtrans_proj.directory is None:
             QMessageBox.warning(self, "경고", "먼저 프로젝트 폴더를 열어주세요.")
@@ -1023,31 +1022,12 @@ class MainWindow(mainwindow_cls):
         if ret != QMessageBox.StandardButton.Yes:
             return
 
-        logs = []
-        try:
-            flatten_directories(root_path, lambda msg: logs.append(msg))
-        except Exception as e:
-            logs.append(f"오류 발생: {e}")
-
-        # 프로젝트 다시 로드하여 페이지 목록 갱신
-        try:
-            self.openDir(directory)
-        except Exception:
-            pass
-
-        # 결과 표시
-        msg = QMessageBox(self)
-        msg.setWindowTitle("하위 폴더 병합 완료")
-        msg.setText("하위 폴더 병합 작업이 완료되었습니다.")
-        msg.setDetailedText("\n".join(logs))
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.exec_()
+        self._run_folder_task_async('flatten', root_path)
 
     def on_restore_folders(self):
         """하위 폴더 복원 (후처리 + 복원) 실행"""
         from qtpy.QtWidgets import QMessageBox
         from pathlib import Path
-        from utils.folder_merge_restore import post_process_and_restore
 
         if self.imgtrans_proj.directory is None:
             QMessageBox.warning(self, "경고", "먼저 프로젝트 폴더를 열어주세요.")
@@ -1071,22 +1051,56 @@ class MainWindow(mainwindow_cls):
         if ret != QMessageBox.StandardButton.Yes:
             return
 
-        logs = []
-        try:
-            post_process_and_restore(root_path, lambda msg: logs.append(msg))
-        except Exception as e:
-            logs.append(f"오류 발생: {e}")
+        self._run_folder_task_async('restore', root_path)
+
+    def _run_folder_task_async(self, task_type, root_path):
+        """폴더 병합/복원 작업을 비동기로 실행"""
+        from .io_thread import FolderMergeRestoreThread
+
+        if not hasattr(self, '_folder_thread'):
+            self._folder_thread = FolderMergeRestoreThread()
+            self._folder_thread.progress_changed.connect(self._on_folder_task_progress)
+            self._folder_thread.task_finished.connect(self._on_folder_task_finished)
+
+        if self._folder_thread.isRunning():
+            return
+
+        # 작업 타입에 따라 팝업 제목 설정
+        if task_type == 'flatten':
+            self._folder_thread.progress_bar.setTaskName('폴더 병합: ')
+            self._folder_thread.runFlatten(root_path)
+        else:
+            self._folder_thread.progress_bar.setTaskName('폴더 복원: ')
+            self._folder_thread.runRestore(root_path)
+
+        self._folder_thread.progress_bar.zero_progress()
+        self._folder_thread.progress_bar.show()
+
+    def _on_folder_task_progress(self, current, total):
+        """폴더 작업 진행률 업데이트"""
+        if hasattr(self, '_folder_thread'):
+            progress = int(current / total * 100) if total > 0 else 0
+            self._folder_thread.progress_bar.updateTaskProgress(progress, f' {current}/{total}')
+
+    def _on_folder_task_finished(self, task_type, logs):
+        """폴더 작업 완료"""
+        if hasattr(self, '_folder_thread'):
+            self._folder_thread.progress_bar.hide()
 
         # 프로젝트 다시 로드하여 페이지 목록 갱신
         try:
-            self.openDir(directory)
+            if self.imgtrans_proj.directory is not None:
+                self.openDir(self.imgtrans_proj.directory)
         except Exception:
             pass
 
         # 결과 표시
+        title = "하위 폴더 병합 완료" if task_type == 'flatten' else "하위 폴더 복원 완료"
+        text = "하위 폴더 병합 작업이 완료되었습니다." if task_type == 'flatten' else "하위 폴더 복원 작업이 완료되었습니다."
+
         msg = QMessageBox(self)
-        msg.setWindowTitle("하위 폴더 복원 완료")
-        msg.setText("하위 폴더 복원 작업이 완료되었습니다.")
+        msg.setWindowTitle(title)
+        msg.setText(text)
         msg.setDetailedText("\n".join(logs))
         msg.setIcon(QMessageBox.Icon.Information)
         msg.exec_()

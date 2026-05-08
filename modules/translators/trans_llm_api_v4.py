@@ -1161,6 +1161,7 @@ def _install_patches():
                             restart_btn = msgBox.addButton(self.tr('Run'), QMessageBox.YesRole)
                             continue_btn = msgBox.addButton(self.tr('Continue'), QMessageBox.AcceptRole)
                             repair_btn = msgBox.addButton('Repair', QMessageBox.ActionRole)
+                            relayout_btn = msgBox.addButton('Re-Layout', QMessageBox.ActionRole)
                             cancel_btn = msgBox.addButton(self.tr('Cancel'), QMessageBox.RejectRole)
 
                             msgBox.setDefaultButton(continue_btn)
@@ -1174,6 +1175,9 @@ def _install_patches():
                                 return
                             elif clicked == repair_btn:
                                 self.on_run_imgtrans(repair_mode=True)
+                                return
+                            elif clicked == relayout_btn:
+                                self.on_run_imgtrans(relayout_mode=True)
                                 return
                         self.on_run_imgtrans()
 
@@ -1210,8 +1214,161 @@ def _install_patches():
                 if not hasattr(_MainWindow, '_original_on_run_imgtrans_v4_repair'):
                     _MainWindow._original_on_run_imgtrans_v4_repair = _MainWindow.on_run_imgtrans
 
-                    def _patched_on_run_imgtrans(self, continue_mode=False, repair_mode=False):
+                    def _patched_on_run_imgtrans(self, continue_mode=False, repair_mode=False, relayout_mode=False):
                         global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES
+
+                        # --- Re-Layout Mode ---
+                        # Skip OCR/Translation/Inpainting entirely.
+                        # Only re-run Auto Layout + Headless Save for pages
+                        # that already have valid translations.
+                        if relayout_mode:
+                            if LOGGER: LOGGER.info("Re-Layout mode: scanning for pages with valid translations...")
+
+                            pages_to_relayout = []
+                            skip_count = 0
+
+                            for page_name, blk_list in self.imgtrans_proj.pages.items():
+                                if not blk_list:
+                                    skip_count += 1
+                                    continue
+
+                                has_valid_translation = False
+                                for blk in blk_list:
+                                    trans = getattr(blk, 'translation', '')
+                                    if isinstance(trans, str) and trans.strip():
+                                        # Blocks with "error" in translation are NOT valid
+                                        if 'error' not in trans.lower():
+                                            has_valid_translation = True
+                                            break
+
+                                if has_valid_translation:
+                                    pages_to_relayout.append(page_name)
+                                else:
+                                    skip_count += 1
+
+                            if not pages_to_relayout:
+                                if LOGGER: LOGGER.info("Re-Layout mode: no pages with valid translations found.")
+                                from utils.message import create_info_dialog
+                                create_info_dialog("레이아웃을 재실행할 유효한 페이지가 없습니다.")
+                                return
+
+                            if LOGGER: LOGGER.info(f"Re-Layout mode: {len(pages_to_relayout)} pages to process, {skip_count} pages skipped")
+
+                            # --- Check which pages need inpainting ---
+                            import os as _os
+                            pages_needing_inpaint = []
+                            for page_name in pages_to_relayout:
+                                inpaint_path = self.imgtrans_proj.get_inpainted_path(page_name, get_last_modified=True)
+                                if not _os.path.exists(inpaint_path):
+                                    pages_needing_inpaint.append(page_name)
+
+                            if pages_needing_inpaint:
+                                if LOGGER: LOGGER.info(f"Re-Layout mode: {len(pages_needing_inpaint)} pages need inpainting first")
+
+                                # Save original pipeline settings
+                                _orig_detect = pcfg.module.enable_detect
+                                _orig_ocr = pcfg.module.enable_ocr
+                                _orig_inpaint = pcfg.module.enable_inpaint
+                                _orig_translate = pcfg.module.enable_translate
+
+                                # Enable only detect + inpaint (inpainter needs mask from detector)
+                                pcfg.module.enable_detect = True
+                                pcfg.module.enable_ocr = False
+                                pcfg.module.enable_translate = False
+                                pcfg.module.enable_inpaint = True
+
+                                # Common setup
+                                self.backup_blkstyles.clear()
+                                if self.bottomBar.textblockChecker.isChecked():
+                                    self.bottomBar.textblockChecker.click()
+                                self.postprocess_mt_toggle = False
+
+                                import threading
+                                _relayout_pages_set = set(pages_to_relayout)
+
+                                # Define callback: when inpaint pipeline finishes, run headless save
+                                def _on_inpaint_finished_then_relayout():
+                                    # Restore original pipeline settings
+                                    pcfg.module.enable_detect = _orig_detect
+                                    pcfg.module.enable_ocr = _orig_ocr
+                                    pcfg.module.enable_inpaint = _orig_inpaint
+                                    pcfg.module.enable_translate = _orig_translate
+                                    if LOGGER: LOGGER.info("Re-Layout mode: inpainting complete, starting headless save...")
+
+                                    # Disconnect this one-shot handler
+                                    try:
+                                        self.module_manager.imgtrans_pipeline_finished.disconnect(_on_inpaint_finished_then_relayout)
+                                    except Exception:
+                                        pass
+
+                                    # Now run headless save in background thread
+                                    def _run_relayout():
+                                        global _V4_REPAIR_MODE, _V4_REPAIR_PAGES
+                                        translate_thread = self.module_manager.translate_thread
+                                        translate_thread.imgtrans_proj = self.imgtrans_proj
+                                        translate_thread._v4_pipeline_start_time = time.time()
+
+                                        # Temporarily disable inpaint flag to skip FIN_INPAINT wait
+                                        # in process_page_hybrid (inpainting is already done at this point)
+                                        _saved_inpaint = pcfg.module.enable_inpaint
+                                        pcfg.module.enable_inpaint = False
+
+                                        _V4_REPAIR_MODE = True
+                                        _V4_REPAIR_PAGES = _relayout_pages_set
+                                        try:
+                                            _v4_headless_save_entry(translate_thread, proj=self.imgtrans_proj)
+                                        finally:
+                                            _V4_REPAIR_MODE = False
+                                            _V4_REPAIR_PAGES = None
+                                            pcfg.module.enable_inpaint = _saved_inpaint
+                                            if LOGGER: LOGGER.info("Re-Layout mode: finished.")
+
+                                    t = threading.Thread(target=_run_relayout, name="V4ReLayoutThread", daemon=True)
+                                    t.start()
+
+                                # Connect one-shot signal
+                                self.module_manager.imgtrans_pipeline_finished.connect(_on_inpaint_finished_then_relayout)
+
+                                # Run inpaint-only pipeline for pages that need it
+                                self.module_manager.runImgtransPipeline(pages_needing_inpaint)
+                                return
+
+                            # --- All pages already inpainted: run headless save directly ---
+                            # Show progress box
+                            self.imgtrans_progress_msgbox.zero_progress()
+                            self.imgtrans_progress_msgbox.show()
+
+                            # Run headless save in background thread
+                            import threading
+                            _relayout_pages_set = set(pages_to_relayout)
+
+                            def _run_relayout():
+                                global _V4_REPAIR_MODE, _V4_REPAIR_PAGES
+                                translate_thread = self.module_manager.translate_thread
+                                translate_thread.imgtrans_proj = self.imgtrans_proj
+                                # Record start time for elapsed display
+                                translate_thread._v4_pipeline_start_time = time.time()
+
+                                # Temporarily disable inpaint flag to skip FIN_INPAINT wait
+                                # in process_page_hybrid (inpainting is already done)
+                                _saved_inpaint = pcfg.module.enable_inpaint
+                                pcfg.module.enable_inpaint = False
+
+                                # Use REPAIR_PAGES filter to limit which pages get rendered
+                                _V4_REPAIR_MODE = True
+                                _V4_REPAIR_PAGES = _relayout_pages_set
+                                try:
+                                    _v4_headless_save_entry(translate_thread, proj=self.imgtrans_proj)
+                                finally:
+                                    _V4_REPAIR_MODE = False
+                                    _V4_REPAIR_PAGES = None
+                                    pcfg.module.enable_inpaint = _saved_inpaint
+                                    if LOGGER: LOGGER.info("Re-Layout mode: finished.")
+
+                            t = threading.Thread(target=_run_relayout, name="V4ReLayoutThread", daemon=True)
+                            t.start()
+                            return
+
                         if not repair_mode:
                             # Delegate to the original (or previously patched) version
                             return self._original_on_run_imgtrans_v4_repair(continue_mode=continue_mode)

@@ -312,3 +312,67 @@ class MergeThread(ThreadBase):
                 LOGGER.error(f'写入JSON文件失败: {e}')
         
         self.merge_finished.emit(success_count, fail_count)
+
+
+class FolderMergeRestoreThread(ThreadBase):
+    """하위 폴더 병합/복원 백그라운드 스레드"""
+    progress_changed = Signal(int, int)  # (현재 진행, 전체)
+    task_finished = Signal(str, list)    # (task_type, logs)
+
+    _thread_exception_type = 'FolderMergeRestoreThread'
+    _thread_error_msg = '폴더 병합/복원 실패'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.root_path = None
+        self.task_type = None  # 'flatten' or 'restore'
+        self.logs = []
+        self.progress_bar = ProgressMessageBox('폴더 작업: ')
+
+    def runFlatten(self, root_path):
+        """폴더 병합 시작"""
+        if self.isRunning():
+            return False
+        self.root_path = root_path
+        self.task_type = 'flatten'
+        self.logs = []
+        self.job = self._run_task
+        self.start()
+        return True
+
+    def runRestore(self, root_path):
+        """폴더 복원(후처리+복원) 시작"""
+        if self.isRunning():
+            return False
+        self.root_path = root_path
+        self.task_type = 'restore'
+        self.logs = []
+        self.job = self._run_task
+        self.start()
+        return True
+
+    def _log_callback(self, msg):
+        self.logs.append(msg)
+
+    def _progress_callback(self, current, total):
+        self.progress_changed.emit(current, total)
+
+    def _run_task(self):
+        from pathlib import Path
+        from utils.folder_merge_restore import flatten_directories, post_process_and_restore
+
+        root = Path(self.root_path) if not isinstance(self.root_path, Path) else self.root_path
+
+        try:
+            if self.task_type == 'flatten':
+                flatten_directories(root, self._log_callback, self._progress_callback)
+            elif self.task_type == 'restore':
+                post_process_and_restore(root, self._log_callback, self._progress_callback)
+        except Exception as e:
+            self.logs.append(f"오류 발생: {e}")
+
+        self.task_finished.emit(self.task_type, self.logs)
+
+    def on_exec_failed(self):
+        self.progress_bar.hide()
+        self.task_finished.emit(self.task_type, self.logs)

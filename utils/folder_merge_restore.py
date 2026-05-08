@@ -19,7 +19,7 @@ LABEL_START = '『'
 LABEL_END = '』'
 
 
-def flatten_directories(root_path: Path, callback=None):
+def flatten_directories(root_path: Path, callback=None, progress_callback=None):
     """
     하위 폴더 내 파일들을 『폴더명』파일명 형식으로 상위 폴더에 병합합니다.
     빈 하위 폴더는 자동으로 삭제됩니다.
@@ -27,20 +27,26 @@ def flatten_directories(root_path: Path, callback=None):
     Args:
         root_path: 대상 루트 폴더 경로
         callback: 진행 상황 로그를 전달할 콜백 함수 (str -> None)
+        progress_callback: 진행률을 전달할 콜백 함수 (current: int, total: int) -> None
     """
     def log(msg):
         if callback:
             callback(msg)
+
+    def report_progress(current, total):
+        if progress_callback:
+            progress_callback(current, total)
 
     subdirs = [d for d in root_path.iterdir() if d.is_dir() and not d.name.startswith('.')]
     if not subdirs:
         log("처리할 하위 폴더가 없습니다.")
         return 0
 
-    log(f"총 {len(subdirs)}개의 폴더를 대상으로 파일 합치기를 시작합니다...")
+    total_dirs = len(subdirs)
+    log(f"총 {total_dirs}개의 폴더를 대상으로 파일 합치기를 시작합니다...")
     total_files_processed = 0
 
-    for subdir_path in subdirs:
+    for idx, subdir_path in enumerate(subdirs):
         dir_name = subdir_path.name
         processed_count = 0
 
@@ -73,6 +79,8 @@ def flatten_directories(root_path: Path, callback=None):
 
         except Exception as e:
             log(f"[{dir_name}] 오류 발생: {e}")
+
+        report_progress(idx + 1, total_dirs)
 
     log(f"\n총 {total_files_processed}개의 파일을 처리했습니다.")
     return total_files_processed
@@ -173,7 +181,7 @@ def _process_single_folder_post(folder_path: str, callback=None):
     return all_steps_successful
 
 
-def _run_post_processing(root_path: Path, callback=None):
+def _run_post_processing(root_path: Path, callback=None, progress_callback=None):
     """
     후처리를 실행합니다.
     - 선택된 폴더 자체에 result/inpainted/mask가 있으면 단일 대상으로 처리
@@ -182,10 +190,15 @@ def _run_post_processing(root_path: Path, callback=None):
     Args:
         root_path: 대상 루트 폴더 경로
         callback: 로그 콜백 함수
+        progress_callback: 진행률을 전달할 콜백 함수 (current: int, total: int) -> None
     """
     def log(msg):
         if callback:
             callback(msg)
+
+    def report_progress(current, total):
+        if progress_callback:
+            progress_callback(current, total)
 
     folders_to_process = []
 
@@ -207,12 +220,20 @@ def _run_post_processing(root_path: Path, callback=None):
         log("처리할 폴더를 찾지 못했습니다.")
         return
 
+    total_folders = len(folders_to_process)
+
     # 스레드로 병렬 처리
     processing_results = []
+    completed_count = [0]  # mutable로 감싸서 스레드 안에서 수정 가능하게
+    import threading as _threading
+    lock = _threading.Lock()
 
     def target_for_thread(folder_path):
         success = _process_single_folder_post(str(folder_path), callback)
-        processing_results.append({'folder_name': folder_path.name, 'success': success})
+        with lock:
+            processing_results.append({'folder_name': folder_path.name, 'success': success})
+            completed_count[0] += 1
+            report_progress(completed_count[0], total_folders)
 
     threads = []
     for folder_p in folders_to_process:
@@ -236,17 +257,22 @@ def _run_post_processing(root_path: Path, callback=None):
         log(f"\n총 {len(processing_results)}개 폴더 중: 성공 {successful_count}개, 실패 {failed_count}개")
 
 
-def _restore_directories(root_path: Path, callback=None):
+def _restore_directories(root_path: Path, callback=None, progress_callback=None):
     """
     라벨링된 파일들을 원래의 폴더 구조로 복원합니다.
 
     Args:
         root_path: 대상 루트 폴더 경로
         callback: 로그 콜백 함수
+        progress_callback: 진행률을 전달할 콜백 함수 (current: int, total: int) -> None
     """
     def log(msg):
         if callback:
             callback(msg)
+
+    def report_progress(current, total):
+        if progress_callback:
+            progress_callback(current, total)
 
     pattern = re.compile(re.escape(LABEL_START) + r"(.+?)" + re.escape(LABEL_END) + r"(.+)")
 
@@ -280,12 +306,13 @@ def _restore_directories(root_path: Path, callback=None):
         log("복원할 파일을 찾지 못했습니다.")
         return 0
 
-    log(f"총 {len(folders_to_restore)}개의 폴더 그룹으로 분류 완료!")
+    total_groups = len(folders_to_restore)
+    log(f"총 {total_groups}개의 폴더 그룹으로 분류 완료!")
     log("본격적인 파일 복원을 시작합니다...")
 
     total_files_processed = 0
 
-    for dir_name, files_to_move in folders_to_restore.items():
+    for idx, (dir_name, files_to_move) in enumerate(folders_to_restore.items()):
         processed_count = 0
         try:
             target_dir_path = root_path / dir_name
@@ -306,12 +333,13 @@ def _restore_directories(root_path: Path, callback=None):
             log(f"[{dir_name}] 그룹 처리 중 오류 발생: {e}")
 
         total_files_processed += processed_count
+        report_progress(idx + 1, total_groups)
 
     log(f"\n총 {total_files_processed}개의 파일을 복원했습니다.")
     return total_files_processed
 
 
-def post_process_and_restore(root_path: Path, callback=None):
+def post_process_and_restore(root_path: Path, callback=None, progress_callback=None):
     """
     후처리 + 복원을 연속으로 실행합니다.
 
@@ -321,13 +349,15 @@ def post_process_and_restore(root_path: Path, callback=None):
     Args:
         root_path: 대상 루트 폴더 경로
         callback: 로그 콜백 함수
+        progress_callback: 진행률을 전달할 콜백 함수 (current: int, total: int) -> None
+            1단계에서는 후처리 폴더 기준, 2단계에서는 복원 그룹 기준으로 호출됩니다.
     """
     def log(msg):
         if callback:
             callback(msg)
 
     log(f"▶ [1단계] '{root_path.name}'의 후처리 작업을 시작합니다.")
-    _run_post_processing(root_path, callback)
+    _run_post_processing(root_path, callback, progress_callback)
     log(f"\n▶ [2단계] '{root_path.name}'의 파일 복원 작업을 시작합니다.")
-    _restore_directories(root_path, callback)
+    _restore_directories(root_path, callback, progress_callback)
     log(f"\n✅ 후처리 + 복원 작업이 완료되었습니다.")
