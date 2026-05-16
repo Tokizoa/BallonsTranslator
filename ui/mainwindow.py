@@ -1492,6 +1492,12 @@ class MainWindow(mainwindow_cls):
         
         # Always set current page and update scene for the completed page
         self.imgtrans_proj.set_current_img_byidx(page_index)
+        
+        # Skip canvas update and save if the image is corrupted/unreadable
+        if not self.imgtrans_proj.img_valid:
+            LOGGER.warning(f'Skipping page {page_index} due to corrupted/unreadable image')
+            return
+        
         self.canvas.updateCanvas()
         self.st_manager.updateSceneTextitems()
         

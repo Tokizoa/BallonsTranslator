@@ -180,9 +180,9 @@ def imread(imgpath, read_type=cv2.IMREAD_COLOR, max_retry_limit=5, retry_interva
             # IMG I/O thread might not finished yet
             num_tries += 1
             if max_retry_limit is not None and num_tries >= max_retry_limit:
-                LOGGER.exception(e)
+                LOGGER.error(f"Cannot identify image file (corrupted or unsupported): {imgpath}")
                 return None
-            LOGGER.warning(f'PIL.UnidentifiedImageError: failed to read {imgpath}, retries: {num_tries} / {max_retry_limit}')
+            LOGGER.debug(f'PIL.UnidentifiedImageError: failed to read {imgpath}, retries: {num_tries} / {max_retry_limit}')
             time.sleep(retry_interval)
     
     return img

@@ -292,7 +292,7 @@ class ProjImgTrans:
             self.inpainted_array = None
 
     def current_has_alpha(self):
-        if self.current_img is None:
+        if self.current_img is None or self.img_array is None:
             return False
         return len(self.img_array.shape) and self.img_array.shape[-1] == 4
 

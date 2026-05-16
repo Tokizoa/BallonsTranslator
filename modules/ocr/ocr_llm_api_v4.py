@@ -2023,17 +2023,30 @@ def _apply_chunked_processing_patch():
             
             # Setup pages
             all_pages = list(self.imgtrans_proj.pages.keys())
+            raw_pages_to_iterate = self.pages_to_process if (self.pages_to_process is not None and len(self.pages_to_process) > 0) else all_pages
+            
+            # [PRE-FLIGHT CHECK] Filter out corrupted images instantly before pipeline starts
+            valid_pages = []
+            from PIL import Image
+            for p in raw_pages_to_iterate:
+                imgpath = os.path.join(self.imgtrans_proj.directory, p)
+                try:
+                    with Image.open(imgpath) as img:
+                        img.verify()
+                    valid_pages.append(p)
+                except Exception as e:
+                    if LOGGER: LOGGER.warning(f"Pre-flight check: Skipping corrupted image '{p}' ({e})")
+            
+            pages_to_iterate = valid_pages
+            
             if self.pages_to_process is not None and len(self.pages_to_process) > 0:
-                pages_to_iterate = self.pages_to_process
-                self.num_pages = len(self.pages_to_process)
-                for process_idx, page_name in enumerate(pages_to_iterate):
-                    if page_name in all_pages:
-                        self.process_idx_to_page_idx[process_idx] = all_pages.index(page_name)
-            else:
-                pages_to_iterate = all_pages
-                self.num_pages = len(self.imgtrans_proj.pages)
-                for i in range(self.num_pages):
-                    self.process_idx_to_page_idx[i] = i
+                self.pages_to_process = valid_pages
+            
+            self.num_pages = len(pages_to_iterate)
+            self.process_idx_to_page_idx.clear()
+            for process_idx, page_name in enumerate(pages_to_iterate):
+                if page_name in all_pages:
+                    self.process_idx_to_page_idx[process_idx] = all_pages.index(page_name)
 
             self.textdetect_thread.num_process_pages = self.num_pages
             self.ocr_thread.num_process_pages = self.num_pages
@@ -2401,6 +2414,7 @@ def _apply_chunked_processing_patch():
                         if LOGGER: LOGGER.warning(f"⚠️ Skipping unreadable image in detection: {imgname}")
                         skipped_files.append(imgname)
                         self.detect_counter += 1
+                        self.update_detect_progress.emit(self.detect_counter)
                         continue
                     try:
                         mask, blk_list = self.textdetector.detect(img, self.imgtrans_proj)

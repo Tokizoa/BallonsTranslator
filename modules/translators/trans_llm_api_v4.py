@@ -388,6 +388,8 @@ def _install_patches():
                         wl_list = get_words_length_list(QFontMetricsF(blk_font), words)
                         text_w, text_h = text_size_func(text)
                         text_area = text_w * text_h
+                        if text_area < 1:  # Guard: degenerate text metrics
+                            text_area = 1
                         if tgt_is_cjk:
                             line_height = int(round(fmt.line_spacing * text_size_func('X木')[1]))
                         else:
@@ -404,32 +406,38 @@ def _install_patches():
                             # [Fix] Logic aligned with SceneTextManager original implementation
                             if blkitem.blk.src_is_vertical and blkitem.blk.vertical != blkitem.blk.src_is_vertical:
                                 adaptive_fntsize = True
-                                area_ratio = ballon_area / text_area
+                                area_ratio = ballon_area / text_area  # text_area guaranteed >= 1 by guard above
                                 ballon_area_thresh = 1.7
                                 downscale_constraint = 0.6
                                 # Safe max calculation
                                 max_wl = max(wl_list) if wl_list else 1
-                                max_wl = max_wl or 1  # Guard: prevent ZeroDivisionError when all word lengths are 0
-                                resize_ratio = np.clip(min(area_ratio / ballon_area_thresh, region_rect[2] / max_wl), downscale_constraint, 1.0)
+                                max_wl = max(max_wl, 1)  # Guard: prevent ZeroDivisionError
+                                region_w = max(region_rect[2], 1)  # Guard: region width can be 0
+                                resize_ratio = np.clip(min(area_ratio / ballon_area_thresh, region_w / max_wl), downscale_constraint, 1.0)
                                 if LOGGER: LOGGER.info(f"AutoLayout: Adaptive Resize (Vertical->Horizontal) Ratio={resize_ratio:.2f}")
 
                             else:
                                 # [MODIFIED] Width Constraint Logic
                                 # Safe max calculation
                                 max_wl = max(wl_list) if wl_list else 1
-                                max_wl = max_wl or 1  # Guard: prevent ZeroDivisionError when all word lengths are 0
-                                width_ratio = region_rect[2] / max_wl
+                                max_wl = max(max_wl, 1)  # Guard: prevent ZeroDivisionError
+                                region_w = max(region_rect[2], 1)  # Guard: region width can be 0
+                                width_ratio = region_w / max_wl
                                 if not src_is_cjk:
-                                    resize_ratio_ballon = max(ballon_area / 1.2 / text_area, 0.7)
+                                    resize_ratio_ballon = max(ballon_area / 1.2 / text_area, 0.7)  # text_area >= 1
                                     if ref_src_lines:
                                         _, src_width = blkitem.blk.normalizd_width_list(normalize=False)
-                                        resize_ratio_src = src_width / (sum(wl_list) + max((len(wl_list) - 1 - len(blkitem.blk.lines_array())), 0) * delimiter_len)
+                                        _wl_denom = sum(wl_list) + max((len(wl_list) - 1 - len(blkitem.blk.lines_array())), 0) * delimiter_len
+                                        _wl_denom = max(_wl_denom, 1)  # Guard: prevent ZeroDivisionError
+                                        resize_ratio_src = src_width / _wl_denom
                                         resize_ratio = min(resize_ratio_ballon, resize_ratio_src, width_ratio)
                                     else:
                                         resize_ratio = min(resize_ratio_ballon, width_ratio)
                                 elif not blkitem.blk.src_is_vertical and ref_src_lines:
                                     _, src_width = blkitem.blk.normalizd_width_list(normalize=False)
-                                    resize_ratio_src = src_width / (sum(wl_list) + max((len(wl_list) - 1 - len(blkitem.blk.lines_array())), 0) * delimiter_len)
+                                    _wl_denom = sum(wl_list) + max((len(wl_list) - 1 - len(blkitem.blk.lines_array())), 0) * delimiter_len
+                                    _wl_denom = max(_wl_denom, 1)  # Guard: prevent ZeroDivisionError
+                                    resize_ratio_src = src_width / _wl_denom
                                     resize_ratio = max(resize_ratio_src * 1.5, 0.5)
                                     resize_ratio = min(resize_ratio, width_ratio)
                                 resize_ratio = min(max(resize_ratio, 0.6), 1)
@@ -515,6 +523,9 @@ def _install_patches():
                         if adaptive_fntsize:
                             downscale_constraint = 0.5
                             w = xywh[2]
+                            if w < 1:  # Guard: layout_text returned zero-width result
+                                if LOGGER: LOGGER.warning(f"[Layout] Skipping post-resize: xywh width is 0 (blk={getattr(blkitem, 'idx', '?')})")
+                                return False
                             post_resize_ratio = np.clip(max(region_rect[2] / w, downscale_constraint), 0, 1)
                             resize_ratio *= post_resize_ratio
 

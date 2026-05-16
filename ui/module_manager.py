@@ -388,21 +388,32 @@ class ImgtransThread(QThread):
         
         # 如果指定了pages_to_process，只处理这些页面
         all_pages = list(self.imgtrans_proj.pages.keys())
+        raw_pages_to_iterate = self.pages_to_process if (self.pages_to_process is not None and len(self.pages_to_process) > 0) else all_pages
+        
+        # [PRE-FLIGHT CHECK] Filter out corrupted images instantly before pipeline starts
+        valid_pages = []
+        from PIL import Image
+        for p in raw_pages_to_iterate:
+            imgpath = os.path.join(self.imgtrans_proj.directory, p)
+            try:
+                with Image.open(imgpath) as img:
+                    img.verify()
+                valid_pages.append(p)
+            except Exception as e:
+                LOGGER.warning(f"Pre-flight check: Skipping corrupted image '{p}' ({e})")
+        
+        pages_to_iterate = valid_pages
+        
         if self.pages_to_process is not None and len(self.pages_to_process) > 0:
-            pages_to_iterate = self.pages_to_process
-            self.num_pages = num_pages = len(self.pages_to_process)
-            # 建立处理索引到实际页面索引的映射
-            for process_idx, page_name in enumerate(pages_to_iterate):
-                if page_name in all_pages:
-                    self.process_idx_to_page_idx[process_idx] = all_pages.index(page_name)
-            LOGGER.info(f'Processing specific pages: {len(pages_to_iterate)} pages')
-        else:
-            pages_to_iterate = all_pages
-            self.num_pages = num_pages = len(self.imgtrans_proj.pages)
-            # 处理索引等于实际页面索引
-            for i in range(num_pages):
-                self.process_idx_to_page_idx[i] = i
-            LOGGER.info(f'Processing all {num_pages} pages')
+            self.pages_to_process = valid_pages
+            
+        self.num_pages = num_pages = len(pages_to_iterate)
+        self.process_idx_to_page_idx.clear()
+        for process_idx, page_name in enumerate(pages_to_iterate):
+            if page_name in all_pages:
+                self.process_idx_to_page_idx[process_idx] = all_pages.index(page_name)
+                
+        LOGGER.info(f'Processing {num_pages} pages after pre-flight check')
         self.textdetect_thread.num_process_pages = self.num_pages
         self.ocr_thread.num_process_pages = self.num_pages
         self.inpaint_thread.num_process_pages = self.num_pages
@@ -425,6 +436,9 @@ class ImgtransThread(QThread):
                 break
                 
             img = self.imgtrans_proj.read_img(imgname)
+            if img is None:
+                LOGGER.warning(f'Skipping corrupted/unreadable image in pipeline: {imgname}')
+                continue
             mask = blk_list = None
             need_save_mask = False
             blk_removed: List[TextBlock] = []
