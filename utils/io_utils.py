@@ -184,6 +184,25 @@ def imread(imgpath, read_type=cv2.IMREAD_COLOR, max_retry_limit=5, retry_interva
                 return None
             LOGGER.debug(f'PIL.UnidentifiedImageError: failed to read {imgpath}, retries: {num_tries} / {max_retry_limit}')
             time.sleep(retry_interval)
+        except OSError as e:
+            # WebP decoder failure or other I/O errors - fallback to cv2
+            LOGGER.warning(f'PIL OSError for {imgpath}: {e}, falling back to cv2')
+            try:
+                raw = np.fromfile(imgpath, dtype=np.uint8)
+                img = cv2.imdecode(raw, read_type)
+                if img is not None:
+                    if read_type != cv2.IMREAD_GRAYSCALE and img.ndim == 3:
+                        if img.shape[-1] == 3:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                        elif img.shape[-1] == 4:
+                            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
+                    break
+                else:
+                    LOGGER.error(f"cv2 fallback also failed for: {imgpath}")
+                    return None
+            except Exception as e2:
+                LOGGER.error(f"cv2 fallback exception for {imgpath}: {e2}")
+                return None
     
     return img
 
