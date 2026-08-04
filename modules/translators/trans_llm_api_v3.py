@@ -248,6 +248,12 @@ class LLM_API_Translator_V3(BaseTranslator):
             "display_name": "안전 필터 수준",
             "description": "Gemini 모델의 안전 필터 수준입니다. 'OFF' 또는 'BLOCK_NONE'을 권장합니다.",
         },
+        "enable_prefill": {
+            "type": "checkbox",
+            "value": True,
+            "display_name": "구조화 프리필 사용",
+            "description": "구조화 모드(CSV 등) 사용 시 모델 응답 형식을 유도하기 위한 프리필(Response type: csv...) 메시지 추가 여부를 설정합니다.",
+        },
         "proxy": {
             "value": "",
             "display_name": "프록시 서버",
@@ -823,6 +829,13 @@ class LLM_API_Translator_V3(BaseTranslator):
         val = self.get_param_value("delay")
         return float(val) if val != "" else 0.3
 
+    @property
+    def enable_prefill(self) -> bool:
+        val = self.get_param_value("enable_prefill")
+        if isinstance(val, str):
+            return val.lower().strip() == 'true'
+        return bool(val) if val is not None else True
+
     def _respect_key_limit(self, key: str) -> bool:
         rpm = self.max_rpm
         if rpm <= 0:
@@ -1080,13 +1093,15 @@ class LLM_API_Translator_V3(BaseTranslator):
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold},
         ]
 
-        # CSV mode: user-user-model structure for content policy bypass
+        contents = [
+            {"role": "user", "parts": [{"text": self.system_prompt}]},
+            {"role": "user", "parts": [{"text": prompt}]},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": self.system_prompt}]},
-                {"role": "user", "parts": [{"text": prompt}]},
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
@@ -1199,13 +1214,15 @@ class LLM_API_Translator_V3(BaseTranslator):
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": safety_threshold},
         ]
 
-        # CSV mode: user-user-model structure for content policy bypass
+        contents = [
+            {"role": "user", "parts": [{"text": self.system_prompt}]},
+            {"role": "user", "parts": [{"text": prompt}]},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": self.system_prompt}]},
-                {"role": "user", "parts": [{"text": prompt}]},
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }

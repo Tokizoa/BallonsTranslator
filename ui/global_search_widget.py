@@ -304,6 +304,12 @@ class GlobalSearchWidget(Widget):
         self.search_editor = SearchEditor(self, commit_latency=-1)
         self.search_editor.setPlaceholderText(self.tr('Find'))
         self.search_editor.enter_pressed.connect(self.commit_search)
+        self.search_history_combo = QComboBox(self)
+        self.search_history_combo.setToolTip(self.tr('Recent searches'))
+        self.search_history_combo.setMaxVisibleItems(5)
+        self.search_history_combo.setFixedWidth(32)
+        self.search_history_combo.view().setMinimumWidth(250)
+        self.search_history_combo.activated.connect(self.on_search_history_selected)
         
         self.no_result_str = self.tr('No results found. ')
         self.doc_edited_str = self.tr('Document changed. Press Enter to re-search.')
@@ -348,6 +354,7 @@ class GlobalSearchWidget(Widget):
 
         hlayout_bar1_0 = QHBoxLayout()
         hlayout_bar1_0.addWidget(self.search_editor)
+        hlayout_bar1_0.addWidget(self.search_history_combo)
         hlayout_bar1_0.setAlignment(Qt.AlignmentFlag.AlignTop)
         hlayout_bar1_0.setSpacing(10)
 
@@ -404,6 +411,44 @@ class GlobalSearchWidget(Widget):
         pcfg.gsearch_range = self.range_combobox.currentIndex()
         self.commit_search()
 
+    def set_search_state(self, search_text: str, history: List[str]):
+        """Restore the persisted search text and at most five recent searches."""
+        search_text = search_text if isinstance(search_text, str) else ''
+        clean_history = []
+        for item in history if isinstance(history, list) else []:
+            if isinstance(item, str) and item and item not in clean_history:
+                clean_history.append(item)
+        clean_history = clean_history[:5]
+
+        self.search_history_combo.blockSignals(True)
+        self.search_history_combo.clear()
+        self.search_history_combo.addItems(clean_history)
+        self.search_history_combo.setCurrentIndex(-1)
+        self.search_history_combo.blockSignals(False)
+        self.search_editor.setPlainText(search_text)
+
+    def remember_current_search(self):
+        text = self.search_editor.toPlainText()
+        pcfg.gsearch_text = text
+        if not text:
+            return
+        current_history = pcfg.gsearch_history if isinstance(pcfg.gsearch_history, list) else []
+        history = [item for item in current_history if isinstance(item, str) and item != text]
+        history.insert(0, text)
+        pcfg.gsearch_history = history[:5]
+
+        self.search_history_combo.blockSignals(True)
+        self.search_history_combo.clear()
+        self.search_history_combo.addItems(pcfg.gsearch_history)
+        self.search_history_combo.setCurrentIndex(-1)
+        self.search_history_combo.blockSignals(False)
+
+    def on_search_history_selected(self, index: int):
+        if index < 0:
+            return
+        self.search_editor.setPlainText(self.search_history_combo.itemText(index))
+        self.commit_search()
+
     def get_regex_pattern(self) -> re.Pattern:
         target_text = self.search_editor.toPlainText()
         regexr = target_text
@@ -424,6 +469,7 @@ class GlobalSearchWidget(Widget):
             return None
 
     def commit_search(self):
+        self.remember_current_search()
         self.search_tree.clearPages()
         pattern = self.get_regex_pattern()
         if pattern is None:

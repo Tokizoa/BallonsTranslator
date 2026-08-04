@@ -206,6 +206,12 @@ class PageSearchWidget(Widget):
         self.search_editor = SearchEditor(self, commit_latency=-1)
         self.search_editor.setPlaceholderText(self.tr('Find'))
         self.search_editor.height_changed.connect(self.on_editor_height_changed)
+        self.search_history_combo = QComboBox(self)
+        self.search_history_combo.setToolTip(self.tr('Recent searches'))
+        self.search_history_combo.setMaxVisibleItems(5)
+        self.search_history_combo.setFixedWidth(32)
+        self.search_history_combo.view().setMinimumWidth(250)
+        self.search_history_combo.activated.connect(self.on_search_history_selected)
         
         self.no_result_str = self.tr('No result')
         self.result_counter_label = QLabel(self.no_result_str)
@@ -254,6 +260,7 @@ class PageSearchWidget(Widget):
 
         hlayout_bar1_0 = QHBoxLayout()
         hlayout_bar1_0.addWidget(self.search_editor)
+        hlayout_bar1_0.addWidget(self.search_history_combo)
         hlayout_bar1_0.addWidget(self.result_counter_label)
         hlayout_bar1_0.setAlignment(Qt.AlignmentFlag.AlignTop)
         hlayout_bar1_0.setSpacing(10)
@@ -307,8 +314,45 @@ class PageSearchWidget(Widget):
         self.hide()
 
     def hideEvent(self, e: QHideEvent) -> None:
+        self.remember_current_search()
         self.clean_highlighted()
         return super().hideEvent(e)
+
+    def set_search_state(self, search_text: str, history: List[str]):
+        """Restore the persisted search text and at most five recent searches."""
+        search_text = search_text if isinstance(search_text, str) else ''
+        clean_history = []
+        for item in history if isinstance(history, list) else []:
+            if isinstance(item, str) and item and item not in clean_history:
+                clean_history.append(item)
+        clean_history = clean_history[:5]
+
+        self.search_history_combo.blockSignals(True)
+        self.search_history_combo.clear()
+        self.search_history_combo.addItems(clean_history)
+        self.search_history_combo.setCurrentIndex(-1)
+        self.search_history_combo.blockSignals(False)
+        self.search_editor.setPlainText(search_text)
+
+    def remember_current_search(self):
+        text = self.search_editor.toPlainText()
+        pcfg.fsearch_text = text
+        if not text:
+            return
+        current_history = pcfg.fsearch_history if isinstance(pcfg.fsearch_history, list) else []
+        history = [item for item in current_history if isinstance(item, str) and item != text]
+        history.insert(0, text)
+        pcfg.fsearch_history = history[:5]
+
+        self.search_history_combo.blockSignals(True)
+        self.search_history_combo.clear()
+        self.search_history_combo.addItems(pcfg.fsearch_history)
+        self.search_history_combo.setCurrentIndex(-1)
+        self.search_history_combo.blockSignals(False)
+
+    def on_search_history_selected(self, index: int):
+        if index >= 0:
+            self.search_editor.setPlainText(self.search_history_combo.itemText(index))
 
     def showEvent(self, e: QShowEvent) -> None:
         self.search_editor.setFocus()
@@ -641,6 +685,7 @@ class PageSearchWidget(Widget):
             self.current_edit.ensure_scene_visible.emit()
 
     def on_next_search_result(self):
+        self.remember_current_search()
         if self.current_cursor is None:
             return
         move = self.move_cursor(1)
@@ -651,6 +696,7 @@ class PageSearchWidget(Widget):
         self.updateCounterText()
 
     def on_prev_search_result(self):
+        self.remember_current_search()
         if self.current_cursor is None:
             return
         move = self.move_cursor(-1)
@@ -677,6 +723,7 @@ class PageSearchWidget(Widget):
         self.page_search()
 
     def on_commit_search(self):
+        pcfg.fsearch_text = self.search_editor.toPlainText()
         self.page_search()
         self.highlight_current_text()
 

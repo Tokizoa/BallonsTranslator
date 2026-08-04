@@ -295,14 +295,24 @@ def is_intel():
 
 def soft_empty_cache():
     gc.collect()
-    if DEFAULT_DEVICE == 'cuda':
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-    elif DEFAULT_DEVICE == 'xpu':
-       torch.xpu.empty_cache()
-       # torch.xpu.ipc_collect()
-    elif DEFAULT_DEVICE == 'mps':
-        torch.mps.empty_cache()
+    try:
+        if DEFAULT_DEVICE == 'cuda':
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        elif DEFAULT_DEVICE == 'xpu':
+            torch.xpu.empty_cache()
+            # torch.xpu.ipc_collect()
+        elif DEFAULT_DEVICE == 'mps':
+            torch.mps.empty_cache()
+    except Exception as e:
+        # Cache release is best-effort.  A CUDA kernel error may be reported
+        # asynchronously here after the actual work and must not escape from a
+        # Qt completion callback and terminate the application.
+        LOGGER.warning(
+            '%s cache cleanup failed; continuing without terminating: %s',
+            DEFAULT_DEVICE.upper(),
+            e,
+        )
 
 
 def DEVICE_SELECTOR(not_supported:list[str]=[]): return deepcopy(

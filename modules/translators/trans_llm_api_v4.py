@@ -22,16 +22,29 @@ _V4_LAYOUT_START_TIME = 0.0  # Layout start timestamp for elapsed time tracking
 _V4_LAYOUT_COMPLETED_COUNT = 0  # Completed page count for layout progress
 _V4_REPAIR_PAGES = None      # Set[str] of page keys to process during repair, None = all pages
 _V4_REPAIR_OCR_PAGES = None  # Set[str] of page keys where OCR is also needed (both src+trans empty)
+_V4_REPAIR_TOTAL_COUNT = 0   # Total target blocks for repair
+_V4_REPAIR_COMPLETED_COUNT = 0 # Completed blocks count during repair
+_V4_AUTOLAYOUT_DETAIL_LOGGING = False  # Per-block AutoLayout diagnostics (default off)
+_V4_HEADLESS_LAYOUT_CALL = False  # True only around the queued main-thread layout call
 
 # Watchdog: heartbeat updated by save workers; a monitor thread dumps all
 # thread stacks when no progress for too long. Diagnostic only - no recovery.
 _V4_SAVE_HEARTBEAT = 0.0
 _V4_SAVE_HEARTBEAT_INFO = ""  # short description of the last heartbeat event
 _V4_WATCHDOG_STOP = None  # threading.Event, created per-run
+_V4_STOP_REQUESTED = False  # Global stop flag for immediate cancellation during render/save
 from pydantic import BaseModel, Field, ValidationError, RootModel, AliasChoices
 from qtpy.QtCore import QObject, Signal, Qt, QRectF
 from qtpy.QtGui import QImage, QPainter, QFont, QColor, QPen
 from qtpy.QtWidgets import QApplication
+
+
+def _autolayout_detail_log(level: str, message: str) -> None:
+    """Emit expensive per-block layout diagnostics only when explicitly enabled."""
+    if not _V4_AUTOLAYOUT_DETAIL_LOGGING or LOGGER is None:
+        return
+    log_func = getattr(LOGGER, level, LOGGER.debug)
+    log_func(message)
 
 # -------------------------------------------------------------------------
 # Utility Imports (Safe at module level)
@@ -166,12 +179,16 @@ def _install_patches():
                         import time
                         import gc
 
-                        # 1. Skip completely during headless save
-                        if _HEADLESS_SAVE_IN_PROGRESS:
+                        force_v4 = bool(kwargs.pop('_v4_force', False))
+
+                        # A standalone re-layout owns the project while it renders. During the
+                        # translation pipeline, however, periodic and final JSON saves are allowed
+                        # and serialized with the exact same project lock as layout mutations.
+                        if _HEADLESS_SAVE_IN_PROGRESS and not _PIPELINE_ACTIVE and not force_v4:
                             return
 
-                        # 2. Debounce during pipeline (min 15 seconds between saves to reduce I/O)
-                        if _PIPELINE_ACTIVE:
+                        # Debounce ordinary pipeline autosaves. The final save bypasses this once.
+                        if _PIPELINE_ACTIVE and not force_v4:
                             current_time = time.time()
                             if current_time - _LAST_SAVE_TIME < 15.0:
                                 # Skip this save, too soon
@@ -285,15 +302,18 @@ def _install_patches():
                     SceneTextManager._original_layout_textblk_patch = SceneTextManager.layout_textblk
                     
                     def _patched_layout_textblk(self, blkitem, text: str = None, mask=None, bounding_rect: List = None, region_rect: List = None):
-                        # [Universal Guard] Completely suppress layout during active pipeline
-                        global _V4_GUI_LAYOUT_ENABLED, _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO
-                        if not _V4_GUI_LAYOUT_ENABLED:
+                        # [Universal Guard] Completely suppress layout during active pipeline or stop requested
+                        global _V4_GUI_LAYOUT_ENABLED, _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO, _V4_STOP_REQUESTED, _V4_HEADLESS_LAYOUT_CALL
+                        if (not _V4_GUI_LAYOUT_ENABLED and not _V4_HEADLESS_LAYOUT_CALL) or _V4_STOP_REQUESTED:
                             return
 
                         # [Diag] Entry log - DEBUG level to avoid flooding logs on 1300-page batches
                         try:
-                            if LOGGER:
-                                LOGGER.debug(f"[Layout] blk={getattr(blkitem, 'idx', '?')} txt_len={len(text) if text else -1} vert={blkitem.blk.vertical}")
+                            _autolayout_detail_log(
+                                "debug",
+                                f"[Layout] blk={getattr(blkitem, 'idx', '?')} "
+                                f"txt_len={len(text) if text else -1} vert={blkitem.blk.vertical}",
+                            )
                         except Exception:
                             pass
 
@@ -414,7 +434,10 @@ def _install_patches():
                                 max_wl = max(max_wl, 1)  # Guard: prevent ZeroDivisionError
                                 region_w = max(region_rect[2], 1)  # Guard: region width can be 0
                                 resize_ratio = np.clip(min(area_ratio / ballon_area_thresh, region_w / max_wl), downscale_constraint, 1.0)
-                                if LOGGER: LOGGER.info(f"AutoLayout: Adaptive Resize (Vertical->Horizontal) Ratio={resize_ratio:.2f}")
+                                _autolayout_detail_log(
+                                    "info",
+                                    f"AutoLayout: Adaptive Resize (Vertical->Horizontal) Ratio={resize_ratio:.2f}",
+                                )
 
                             else:
                                 # [MODIFIED] Width Constraint Logic
@@ -471,14 +494,14 @@ def _install_patches():
                         # [Diag] Log inputs right before the (historically-hanging) layout_text call.
                         # The last occurrence of this INFO line before a freeze pinpoints the hang site.
                         try:
-                            if LOGGER:
-                                _mask_shape = getattr(mask, 'shape', None)
-                                _page = getattr(getattr(self, 'imgtrans_proj', None), 'current_img', '?')
-                                LOGGER.info(
-                                    f"[Layout->text] page={_page} blk={getattr(blkitem, 'idx', '?')} "
-                                    f"mask={_mask_shape} words={len(words)} lh={line_height} "
-                                    f"rr={resize_ratio:.3f} adaptive={adaptive_fntsize}"
-                                )
+                            _mask_shape = getattr(mask, 'shape', None)
+                            _page = getattr(getattr(self, 'imgtrans_proj', None), 'current_img', '?')
+                            _autolayout_detail_log(
+                                "info",
+                                f"[Layout->text] page={_page} blk={getattr(blkitem, 'idx', '?')} "
+                                f"mask={_mask_shape} words={len(words)} lh={line_height} "
+                                f"rr={resize_ratio:.3f} adaptive={adaptive_fntsize}",
+                            )
                         except Exception:
                             pass
                         _V4_SAVE_HEARTBEAT = time.time()
@@ -510,11 +533,11 @@ def _install_patches():
                             return False
                         _V4_SAVE_HEARTBEAT = time.time()
                         try:
-                            if LOGGER:
-                                LOGGER.info(
-                                    f"[Layout/ok] blk={getattr(blkitem, 'idx', '?')} "
-                                    f"xywh={xywh} lines={new_text.count(chr(10)) + 1}"
-                                )
+                            _autolayout_detail_log(
+                                "info",
+                                f"[Layout/ok] blk={getattr(blkitem, 'idx', '?')} "
+                                f"xywh={xywh} lines={new_text.count(chr(10)) + 1}",
+                            )
                         except Exception:
                             pass
 
@@ -1226,7 +1249,7 @@ def _install_patches():
                     _MainWindow._original_on_run_imgtrans_v4_repair = _MainWindow.on_run_imgtrans
 
                     def _patched_on_run_imgtrans(self, continue_mode=False, repair_mode=False, relayout_mode=False):
-                        global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES
+                        global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES, _V4_REPAIR_TOTAL_COUNT, _V4_REPAIR_COMPLETED_COUNT
 
                         # --- Re-Layout Mode ---
                         # Skip OCR/Translation/Inpainting entirely.
@@ -1381,19 +1404,41 @@ def _install_patches():
                             return
 
                         if not repair_mode:
+                            # A repair run temporarily changes the shared pipeline
+                            # configuration.  The normal completion callback should
+                            # restore it, but a cancelled/stalled run can miss that
+                            # signal.  Never let that temporary state leak into the
+                            # next ordinary project run.
+                            restore_repair_settings = getattr(self, '_v4_repair_restore_settings', None)
+                            if callable(restore_repair_settings):
+                                if LOGGER:
+                                    LOGGER.warning(
+                                        "Repair mode cleanup was still pending; restoring "
+                                        "the normal pipeline before this run."
+                                    )
+                                restore_repair_settings()
+
                             # Delegate to the original (or previously patched) version
                             return self._original_on_run_imgtrans_v4_repair(continue_mode=continue_mode)
 
                         # --- Repair Mode ---
                         # Find all blocks whose translation contains "error",
-                        # is empty with source present, or has both source AND translation empty.
-                        if LOGGER: LOGGER.info("Repair mode: scanning for error/empty/blank translations...")
+                        # is empty with source present, has both source AND translation empty,
+                        # or contains untranslated Japanese text (when source also had Japanese).
+                        if LOGGER: LOGGER.info("Repair mode: scanning for error/empty/blank/untranslated Japanese translations...")
+
+                        jp_char_regex = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+                        # A translated box can legitimately retain a Japanese name,
+                        # SFX, or quoted phrase.  Treat it as untranslated only when
+                        # it contains no Korean at all (syllables or jamo).
+                        ko_char_regex = re.compile(r'[\uac00-\ud7a3\u1100-\u11ff\u3130-\u318f]')
 
                         pages_to_repair = []
                         pages_needing_ocr = set()  # Pages where at least one block needs OCR
                         error_count = 0
                         empty_count = 0
                         blank_count = 0  # Both source AND translation are empty
+                        untranslated_jp_count = 0  # Translation is present but still in Japanese (and source also had Japanese)
                         for page_name, blk_list in self.imgtrans_proj.pages.items():
                             page_needs_repair = False
                             for blk in blk_list:
@@ -1421,6 +1466,16 @@ def _install_patches():
                                     needs_repair = True
                                     needs_ocr = True
                                     blank_count += 1
+                                elif has_source and has_trans:
+                                    # A box that contains both Japanese and Korean is
+                                    # already translated; only Japanese-only output is
+                                    # a repair target.
+                                    translation_text = str(trans)
+                                    if (jp_char_regex.search(translation_text)
+                                            and not ko_char_regex.search(translation_text)):
+                                        if jp_char_regex.search(joined_source):
+                                            needs_repair = True
+                                            untranslated_jp_count += 1
 
                                 if needs_repair:
                                     blk.translation = ''
@@ -1433,17 +1488,32 @@ def _install_patches():
                             if page_needs_repair:
                                 pages_to_repair.append(page_name)
 
-                        total_count = error_count + empty_count + blank_count
+                        total_count = error_count + empty_count + blank_count + untranslated_jp_count
                         if total_count == 0:
-                            if LOGGER: LOGGER.info("Repair mode: no errors or empty/blank translations found, nothing to do.")
+                            if LOGGER: LOGGER.info("Repair mode: no errors, empty/blank, or untranslated Japanese translations found, nothing to do.")
                             from utils.message import create_info_dialog
-                            create_info_dialog("No translation errors or empty/blank translations found. Nothing to repair.")
+                            create_info_dialog("No translation errors, empty/blank translations, or untranslated Japanese blocks found. Nothing to repair.")
                             return
 
-                        if LOGGER: LOGGER.info(f"Repair mode: found {error_count} error + {empty_count} empty + {blank_count} blank blocks across {len(pages_to_repair)} pages. Starting re-translation...")
+                        _V4_REPAIR_TOTAL_COUNT = total_count
+                        _V4_REPAIR_COMPLETED_COUNT = 0
+
+                        log_msg = (
+                            f"[Repair 대상 확정] 총 {total_count}개 블록이 대기열에 등록되었습니다. "
+                            f"(페이지: {len(pages_to_repair)}개 | 에러: {error_count}개, 비어있음: {empty_count}개, "
+                            f"OCR필요: {blank_count}개, 일본어 미번역: {untranslated_jp_count}개)"
+                        )
+                        if LOGGER: LOGGER.info(log_msg)
+
                         has_ocr_pages = bool(pages_needing_ocr)
                         if has_ocr_pages:
                             if LOGGER: LOGGER.info(f"Repair mode: {len(pages_needing_ocr)} pages need OCR (both src+trans empty)")
+
+                        # If a previous repair did not reach its completion signal,
+                        # restore it before recording this run's baseline settings.
+                        restore_repair_settings = getattr(self, '_v4_repair_restore_settings', None)
+                        if callable(restore_repair_settings):
+                            restore_repair_settings()
 
                         # Activate repair mode filter
                         _V4_REPAIR_MODE = True
@@ -1476,8 +1546,14 @@ def _install_patches():
                             for textblk in blklist:
                                 ffmt_list.append(textblk.fontformat.deepcopy())
 
-                        # Define a restore callback
+                        # Define an idempotent restore callback.  Keep it on the
+                        # window as a fallback for the next normal run because the
+                        # completion signal is not guaranteed after cancellation.
+                        restore_state = {'done': False}
                         def _restore_settings():
+                            if restore_state['done']:
+                                return
+                            restore_state['done'] = True
                             global _V4_REPAIR_MODE, _V4_REPAIR_PAGES, _V4_REPAIR_OCR_PAGES
                             _V4_REPAIR_MODE = False
                             _V4_REPAIR_PAGES = None
@@ -1486,7 +1562,11 @@ def _install_patches():
                             pcfg.module.enable_ocr = _orig_ocr
                             pcfg.module.enable_inpaint = _orig_inpaint
                             pcfg.module.enable_translate = _orig_translate
+                            if getattr(self, '_v4_repair_restore_settings', None) is _restore_settings:
+                                self._v4_repair_restore_settings = None
                             if LOGGER: LOGGER.info("Repair mode: original pipeline settings restored. Repair filter deactivated.")
+
+                        self._v4_repair_restore_settings = _restore_settings
 
                         # Connect one-shot restore when pipeline finishes
                         def _on_repair_finished():
@@ -1809,6 +1889,182 @@ class SaveSignaler(QObject):
     progress_signal = Signal(int, str)
     finished_signal = Signal()
 
+
+def _set_v4_layout_state(translate_thread, page_key: str, state: str) -> None:
+    """Record one page's layout lifecycle."""
+    lock = getattr(translate_thread, '_v4_layout_state_lock', None)
+    if lock is None:
+        lock = threading.Lock()
+        translate_thread._v4_layout_state_lock = lock
+    with lock:
+        states = getattr(translate_thread, '_v4_layout_states', None)
+        if states is None:
+            states = {}
+            translate_thread._v4_layout_states = states
+        states[page_key] = state
+
+
+def _claim_v4_layout_page(translate_thread, page_key: str) -> bool:
+    """Atomically place a page in waiting state exactly once for this run."""
+    lock = getattr(translate_thread, '_v4_layout_state_lock', None)
+    if lock is None:
+        lock = threading.Lock()
+        translate_thread._v4_layout_state_lock = lock
+    with lock:
+        states = getattr(translate_thread, '_v4_layout_states', None)
+        if states is None:
+            states = {}
+            translate_thread._v4_layout_states = states
+        if page_key in states:
+            return False
+        states[page_key] = 'waiting'
+        return True
+
+
+def _add_v4_layout_timing(translate_thread, phase: str, elapsed: float) -> None:
+    lock = getattr(translate_thread, '_v4_layout_timing_lock', None)
+    if lock is None:
+        lock = threading.Lock()
+        translate_thread._v4_layout_timing_lock = lock
+    with lock:
+        timings = getattr(translate_thread, '_v4_layout_timings', None)
+        if timings is None:
+            timings = {}
+            translate_thread._v4_layout_timings = timings
+        timings[phase] = timings.get(phase, 0.0) + elapsed
+
+
+def _layout_page_readiness(translate_thread, page_key: str, wait_for_pipeline: bool) -> str:
+    """Return ready/waiting/failed/cancelled for one page without mutating it."""
+    if getattr(translate_thread, 'stop_requested', False) or _V4_STOP_REQUESTED:
+        return 'cancelled'
+
+    proj = getattr(translate_thread, 'imgtrans_proj', None)
+    info = proj._image_info.get(page_key, {}) if proj is not None else {}
+    if info.get('corrupted', False):
+        return 'failed'
+
+    if wait_for_pipeline:
+        state_lock = getattr(translate_thread, '_v4_layout_state_lock', None)
+        if state_lock is None:
+            translated_pages = getattr(translate_thread, '_v4_translated_pages', set())
+            failed_pages = getattr(translate_thread, '_v4_translation_failed_pages', set())
+            inpaint_failed_pages = getattr(translate_thread, '_v4_inpaint_failed_pages', set())
+        else:
+            with state_lock:
+                translated_pages = set(getattr(translate_thread, '_v4_translated_pages', set()))
+                failed_pages = set(getattr(translate_thread, '_v4_translation_failed_pages', set()))
+                inpaint_failed_pages = set(getattr(translate_thread, '_v4_inpaint_failed_pages', set()))
+        if page_key in failed_pages or page_key in inpaint_failed_pages:
+            return 'failed'
+        if page_key not in translated_pages:
+            return 'waiting'
+
+    if RunStatus is None:
+        return 'ready'
+
+    finish_code = info.get('finish_code', 0)
+    module_cfg = getattr(pcfg, 'module', None) if pcfg is not None else None
+    if wait_for_pipeline and getattr(module_cfg, 'enable_ocr', False):
+        if not finish_code & RunStatus.FIN_OCR:
+            return 'waiting'
+    if getattr(module_cfg, 'enable_inpaint', False):
+        if not finish_code & RunStatus.FIN_INPAINT:
+            return 'waiting'
+    return 'ready'
+
+
+def _prepare_layout_page(proj, page_key: str, enable_autolayout: bool = True):
+    """Load a page and perform only the OpenCV balloon analysis off the GUI thread."""
+    started_at = time.perf_counter()
+    img_path = proj.get_inpainted_path(page_key)
+    if not os.path.exists(img_path):
+        img_path = os.path.join(proj.directory, page_key)
+
+    image = QImage(img_path)
+    if image.isNull():
+        raise RuntimeError(f"V4 Render: Failed to load image {img_path}")
+
+    prepared_blocks = {}
+    blk_list = proj.pages.get(page_key, [])
+    if enable_autolayout and blk_list:
+        import numpy as np
+        from utils.imgproc_utils import extract_ballon_region
+
+        image_rgb = image.convertToFormat(QImage.Format_RGB888)
+        width, height = image_rgb.width(), image_rgb.height()
+        ptr = image_rgb.bits()
+        ptr.setsize(height * width * 3)
+        img_array = np.frombuffer(ptr, dtype=np.uint8).reshape((height, width, 3))
+
+        for index, blk in enumerate(blk_list):
+            txt = getattr(blk, 'translation', '') or getattr(blk, 'rich_text', '')
+            if not txt or not str(txt).strip():
+                continue
+
+            widened_xyxy = None
+            if getattr(blk, 'src_is_vertical', False):
+                x1, y1, x2, y2 = blk.xyxy
+                width_now, height_now = x2 - x1, y2 - y1
+                new_width = max(width_now, height_now * 1.5)
+                center_x = (x1 + x2) / 2
+                widened_xyxy = [
+                    int(center_x - new_width / 2),
+                    y1,
+                    int(center_x + new_width / 2),
+                    y2,
+                ]
+
+            if blk.translation == getattr(blk, '_v4_last_layout_text', ''):
+                prepared_blocks[index] = {
+                    'skip_layout': True,
+                    'widened_xyxy': widened_xyxy,
+                }
+                continue
+
+            blk_rect = blk.bounding_rect()
+            if blk_rect is None or len(blk_rect) < 4:
+                prepared_blocks[index] = {
+                    'error': f"Invalid Rect: {blk_rect}",
+                    'widened_xyxy': widened_xyxy,
+                }
+                continue
+
+            width_now, height_now = blk_rect[2], blk_rect[3]
+            if width_now <= 0 or height_now <= 0:
+                prepared_blocks[index] = {
+                    'error': f"Invalid Rect: {blk_rect}",
+                    'widened_xyxy': widened_xyxy,
+                }
+                continue
+
+            enlarge_ratio = min(max(width_now / height_now, height_now / width_now) * 1.5, 2.5)
+            result = extract_ballon_region(
+                img_array,
+                blk_rect,
+                enlarge_ratio=enlarge_ratio,
+                cal_region_rect=True,
+            )
+            if result and len(result) >= 4:
+                prepared_blocks[index] = {
+                    'mask': result[0],
+                    'region_rect': result[3],
+                    'bounding_rect': blk_rect,
+                    'widened_xyxy': widened_xyxy,
+                }
+            else:
+                prepared_blocks[index] = {
+                    'error': f"Extraction failed: {result}",
+                    'widened_xyxy': widened_xyxy,
+                }
+
+    return {
+        'image': image,
+        'blocks': prepared_blocks,
+        'prepare_seconds': time.perf_counter() - started_at,
+    }
+
+
 class UIHelper(QObject):
     def __init__(self, msgbox, proj=None, stm=None, total_pages=None, pipeline_start_time=None):
         super().__init__()
@@ -1816,6 +2072,9 @@ class UIHelper(QObject):
         self.proj = proj
         self.stm = stm # [NEW] SceneTextManager for layout/refresh
         self.rendered_images = {} # Thread-safe storage for cross-thread return values
+        self.render_timings = {}
+        self.prepared_pages = {}
+        self.prepared_pages_lock = threading.Lock()
         self._layout_start_time = time.time()  # Track layout start time
         self._layout_completed_count = 0  # Track completed page count
         self._layout_total_pages = total_pages if total_pages is not None else (len(proj.pages) if proj else 0)
@@ -1888,6 +2147,7 @@ class UIHelper(QObject):
         Renders the page to a QImage on the Main Thread.
         Stores result in self.rendered_images[page_key]
         """
+        render_started = time.perf_counter()
         # --- AutoLayout Progress ---
         _total = self._layout_total_pages if self._layout_total_pages else (len(self.proj.pages) if self.proj else '?')
         _page_keys = list(self.proj.pages.keys()) if self.proj else []
@@ -1900,6 +2160,14 @@ class UIHelper(QObject):
         _elapsed_str = f"{_elapsed_m}분 {_elapsed_s}초" if _elapsed_m > 0 else f"{_elapsed_s}초"
         if LOGGER: LOGGER.info(f"\U0001f4d0 AutoLayout(Render): \ud398\uc774\uc9c0 [{_page_idx}/{_total}] (\uc644\ub8cc: {self._layout_completed_count}/{_total}) \u23f1 {_time_str} (+{_elapsed_str}) - {page_key}")
 
+        with self.prepared_pages_lock:
+            prepared_page = self.prepared_pages.pop(page_key, None)
+        prepared_blocks = prepared_page.get('blocks', {}) if prepared_page else {}
+
+        project_lock = getattr(self.proj, '_v4_save_lock', None) if self.proj else None
+        if project_lock is not None:
+            project_lock.acquire()
+
         try:
             # Import GUI classes locally to avoid circular dependencies at module level
             from ui.textitem import TextBlkItem
@@ -1911,15 +2179,16 @@ class UIHelper(QObject):
                 self.rendered_images[page_key] = None
                 return
                 
-            # Load Image
-            img_path = self.proj.get_inpainted_path(page_key)
-            if not os.path.exists(img_path):
-                # Fallback to original image: directory + page_key
-                img_path = os.path.join(self.proj.directory, page_key)
-            
-            image = QImage(img_path)
+            # The worker-loaded QImage and OpenCV results are safe to hand over.
+            # QPixmap/QGraphicsScene/TextBlkItem creation remains on this GUI thread.
+            image = prepared_page.get('image') if prepared_page else None
+            if image is None:
+                img_path = self.proj.get_inpainted_path(page_key)
+                if not os.path.exists(img_path):
+                    img_path = os.path.join(self.proj.directory, page_key)
+                image = QImage(img_path)
             if image.isNull():
-                print(f"V4 Render: Failed to load image {img_path}")
+                print(f"V4 Render: Failed to load image for {page_key}")
                 self.rendered_images[page_key] = None
                 return
 
@@ -1937,9 +2206,11 @@ class UIHelper(QObject):
             # Add Text Blocks
             blk_list = self.proj.pages.get(page_key, [])
             
-            # [NEW] Pre-calculate image array for layout logic
+            # Legacy/direct re-layout fallback. Incremental pipeline pages already
+            # performed this pure OpenCV work in a bounded background worker.
             img_array = None
-            if self.stm and pcfg.let_autolayout_flag and blk_list:
+            image_rgb = None
+            if prepared_page is None and self.stm and pcfg.let_autolayout_flag and blk_list:
                 try:
                     import numpy as np
                     image_rgb = image.convertToFormat(QImage.Format_RGB888)
@@ -1952,14 +2223,13 @@ class UIHelper(QObject):
                     print(f"V4 Render: Image conversion failed: {img_err}")
                     image_rgb = None  # Ensure cleanup
 
-            global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO
+            global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO, _V4_HEADLESS_LAYOUT_CALL
             for i, blk in enumerate(blk_list):
                 # [Diag] Per-block heartbeat + debug log. Last logged (page, blk) before a
                 # freeze is exactly the block where the main thread hung.
                 _V4_SAVE_HEARTBEAT = time.time()
                 _V4_SAVE_HEARTBEAT_INFO = f"render:{page_key}:blk={i}/{len(blk_list)}"
-                if LOGGER:
-                    LOGGER.debug(f"[Render/blk] page={page_key} blk={i}/{len(blk_list)}")
+                _autolayout_detail_log('debug', f"[Render/blk] page={page_key} blk={i}/{len(blk_list)}")
 
                 # Try getting translation, fallback to rich_text if empty
                 txt = getattr(blk, 'translation', '')
@@ -1979,9 +2249,45 @@ class UIHelper(QObject):
                     text_item = TextBlkItem(blk, idx=i, set_format=True, show_rect=False)
                     text_item.setZValue(10) # Ensure it's above background
                     scene.addItem(text_item)
-                    
-                    # [NEW] Apply Auto Layout during headless render
-                    if self.stm and img_array is not None and pcfg.let_autolayout_flag:
+
+                    # Apply worker-prepared layout data without changing the Qt path.
+                    if self.stm and prepared_page is not None and pcfg.let_autolayout_flag:
+                        block_prep = prepared_blocks.get(i)
+                        if block_prep:
+                            widened_xyxy = block_prep.get('widened_xyxy')
+                            if widened_xyxy is not None:
+                                blk.xyxy[0], blk.xyxy[1], blk.xyxy[2], blk.xyxy[3] = widened_xyxy
+
+                            if block_prep.get('skip_layout'):
+                                _autolayout_detail_log(
+                                    'debug',
+                                    f"V4 Render: Skipping layout for {i} (Text unchanged)",
+                                )
+                            elif block_prep.get('error'):
+                                if LOGGER:
+                                    LOGGER.warning(
+                                        f"V4 Render: Skipping Auto Layout for {i} "
+                                        f"({block_prep['error']})"
+                                    )
+                            else:
+                                old_flag = self.stm.auto_textlayout_flag
+                                old_headless_call = _V4_HEADLESS_LAYOUT_CALL
+                                self.stm.auto_textlayout_flag = True
+                                _V4_HEADLESS_LAYOUT_CALL = True
+                                try:
+                                    self.stm.layout_textblk(
+                                        text_item,
+                                        mask=block_prep.get('mask'),
+                                        region_rect=block_prep.get('region_rect'),
+                                        bounding_rect=block_prep.get('bounding_rect'),
+                                    )
+                                    blk._v4_last_layout_text = blk.translation
+                                finally:
+                                    self.stm.auto_textlayout_flag = old_flag
+                                    _V4_HEADLESS_LAYOUT_CALL = old_headless_call
+
+                    # Direct re-layout fallback retains the former exact path.
+                    elif self.stm and img_array is not None and pcfg.let_autolayout_flag:
                         try:
                             from utils.imgproc_utils import extract_ballon_region
                             
@@ -1996,7 +2302,10 @@ class UIHelper(QObject):
                             
                             # [Performance Optimization] O(N) Skip check
                             if blk.translation == getattr(blk, '_v4_last_layout_text', ''):
-                                if LOGGER: LOGGER.debug(f"V4 Render: Skipping layout for {i} (Text unchanged)")
+                                _autolayout_detail_log(
+                                    'debug',
+                                    f"V4 Render: Skipping layout for {i} (Text unchanged)",
+                                )
                                 # Still need to render, but skip expensive find_balloon
                                 mask = None
                                 region_rect = None
@@ -2016,7 +2325,9 @@ class UIHelper(QObject):
                                         mask, _, _, region_rect = ret
                                         # Force flag to ensure layout_textblk runs its resizing logic
                                         old_flag = self.stm.auto_textlayout_flag
+                                        old_headless_call = _V4_HEADLESS_LAYOUT_CALL
                                         self.stm.auto_textlayout_flag = True
+                                        _V4_HEADLESS_LAYOUT_CALL = True
                                         try:
                                             # [Fix] Pass bounding_rect to prevent None access inside layout_textblk
                                             self.stm.layout_textblk(text_item, mask=mask, region_rect=region_rect, bounding_rect=blk_rect)
@@ -2024,6 +2335,7 @@ class UIHelper(QObject):
                                             blk._v4_last_layout_text = blk.translation
                                         finally:
                                             self.stm.auto_textlayout_flag = old_flag
+                                            _V4_HEADLESS_LAYOUT_CALL = old_headless_call
                                     else:
                                         if LOGGER: LOGGER.warning(f"V4 Render: Extraction failed for {i} (Ret: {ret})")
                         except Exception as layout_err:
@@ -2073,7 +2385,7 @@ class UIHelper(QObject):
                 img_array = None
             # Release the QImage.Format_RGB888 copy created for numpy view so its
             # underlying buffer is freed immediately instead of waiting for GC.
-            if 'image_rgb' in locals() and image_rgb is not None:
+            if image_rgb is not None:
                 try:
                     del image_rgb
                 except Exception:
@@ -2086,6 +2398,10 @@ class UIHelper(QObject):
             import traceback
             traceback.print_exc()
             self.rendered_images[page_key] = None
+        finally:
+            self.render_timings[page_key] = time.perf_counter() - render_started
+            if project_lock is not None:
+                project_lock.release()
 
 class TaskRunner(QObject):
     def __init__(self, task):
@@ -2303,6 +2619,12 @@ class LLM_API_Translator_V4(BaseTranslator):
             "display_name": "입출력 구조화 형식",
             "description": "LLM에 보낼 원문과 응답의 구조화 형식입니다. CSV: 기존 CSV 포맷, JSON: compact JSON 배열 형식.",
         },
+        "enable_prefill": {
+            "type": "checkbox",
+            "value": True,
+            "display_name": "구조화 프리필 사용",
+            "description": "구조화 모드(CSV 등) 사용 시 모델 응답 형식을 유도하기 위한 프리필(Response type: csv...) 메시지 추가 여부를 설정합니다.",
+        },
         "content_encryption": {
             "type": "selector",
             "options": ["없음", "Base64", "Atbash"],
@@ -2316,11 +2638,19 @@ class LLM_API_Translator_V4(BaseTranslator):
             "display_name": "리퀘스트/리스폰스 로깅",
             "description": "활성화하면 API 요청 직전의 리퀘스트 바디와 응답 직후의 리스폰스 바디를 터미널과 로그에 출력합니다.",
         },
+        "autolayout_detail_logging": {
+            "type": "checkbox",
+            "value": False,
+            "display_name": "AutoLayout 상세 로그",
+            "description": "활성화하면 말풍선별 AutoLayout 비율, 마스크, 좌표 진단을 출력합니다. 페이지 진행률과 오류는 항상 출력됩니다.",
+        },
     }
 
     def __init__(self, *args, **params) -> None:
         super().__init__(*args, **params)
         self._setup_translator()
+        global _V4_AUTOLAYOUT_DETAIL_LOGGING
+        _V4_AUTOLAYOUT_DETAIL_LOGGING = self.autolayout_detail_logging
         
         # Install patches immediately if safe to ensure V4 pipeline is active
         import sys
@@ -2369,8 +2699,13 @@ class LLM_API_Translator_V4(BaseTranslator):
         # Call parent or base translation logic with filtered list
         res = super().translate_textblk_lst(filtered_list, *args, **kwargs)
 
-        # [Repair Mode] Clean up repair flags after translation
+        # [Repair Mode] Clean up repair flags after translation & log progress
         if _V4_REPAIR_MODE:
+            global _V4_REPAIR_COMPLETED_COUNT, _V4_REPAIR_TOTAL_COUNT
+            _V4_REPAIR_COMPLETED_COUNT += len(filtered_list)
+            if LOGGER:
+                LOGGER.info(f"[Repair 진행률] {_V4_REPAIR_COMPLETED_COUNT} / {_V4_REPAIR_TOTAL_COUNT} 블록 완료")
+
             for blk in filtered_list:
                 try:
                     del blk._v4_needs_repair
@@ -3194,6 +3529,20 @@ class LLM_API_Translator_V4(BaseTranslator):
             return val.lower().strip() == 'true'
         return bool(val)
 
+    @property
+    def autolayout_detail_logging(self) -> bool:
+        val = self.get_param_value("autolayout_detail_logging")
+        if isinstance(val, str):
+            return val.lower().strip() == 'true'
+        return bool(val)
+
+    @property
+    def enable_prefill(self) -> bool:
+        val = self.get_param_value("enable_prefill")
+        if isinstance(val, str):
+            return val.lower().strip() == 'true'
+        return bool(val) if val is not None else True
+
     # --- 암호화 헬퍼 메서드 ---
     @staticmethod
     def _atbash_text(text: str) -> str:
@@ -3667,8 +4016,9 @@ class LLM_API_Translator_V4(BaseTranslator):
             {"role": "user", "parts": [{"text": self.system_prompt}]},
             {"role": "user", "parts": [{"text": prompt}]},
         ]
-        if self.input_format != "JSON":
+        if self.input_format != "JSON" and self.enable_prefill:
             contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+            contents.append({"role": "user", "parts": [{"text": "continue"}]})
 
         payload = {
             "contents": contents,
@@ -3799,8 +4149,9 @@ class LLM_API_Translator_V4(BaseTranslator):
             {"role": "user", "parts": [{"text": self.system_prompt}]},
             {"role": "user", "parts": [{"text": prompt}]},
         ]
-        if self.input_format != "JSON":
+        if self.input_format != "JSON" and self.enable_prefill:
             contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+            contents.append({"role": "user", "parts": [{"text": "continue"}]})
 
         payload = {
             "contents": contents,
@@ -3927,8 +4278,9 @@ class LLM_API_Translator_V4(BaseTranslator):
             {"role": "user", "parts": [{"text": self.system_prompt}]},
             {"role": "user", "parts": [{"text": prompt}]},
         ]
-        if self.input_format != "JSON":
+        if self.input_format != "JSON" and self.enable_prefill:
             contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+            contents.append({"role": "user", "parts": [{"text": "continue"}]})
 
         payload = {
             "contents": contents,
@@ -4061,8 +4413,9 @@ class LLM_API_Translator_V4(BaseTranslator):
             {"role": "user", "parts": [{"text": self.system_prompt}]},
             {"role": "user", "parts": [{"text": prompt}]},
         ]
-        if self.input_format != "JSON":
+        if self.input_format != "JSON" and self.enable_prefill:
             contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+            contents.append({"role": "user", "parts": [{"text": "continue"}]})
 
         payload = {
             "contents": contents,
@@ -4345,12 +4698,15 @@ class LLM_API_Translator_V4(BaseTranslator):
         super().updateParam(param_key, param_content)
         if param_key in ["proxy", "multiple_keys", "apikey", "provider", "endpoint"]:
             self.client = None
+        if param_key == "autolayout_detail_logging":
+            global _V4_AUTOLAYOUT_DETAIL_LOGGING
+            _V4_AUTOLAYOUT_DETAIL_LOGGING = self.autolayout_detail_logging
 
 # -------------------------------------------------------------------------
 # Monkey Patch Implementation
 # -------------------------------------------------------------------------
 
-def _v4_headless_save_entry(translate_thread, proj=None):
+def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False):
     """
     V4: TRUE HEADLESS BACKGROUND SAVING (Parallel & Optimized).
     Executes entirely in background thread, updates UI via Signals.
@@ -4359,7 +4715,14 @@ def _v4_headless_save_entry(translate_thread, proj=None):
     
     import time
     
-    # Set flag to suppress redundant JSON saves during headless save
+    translate_thread._v4_layout_save_error = None
+    if not hasattr(translate_thread, '_v4_layout_timing_lock'):
+        translate_thread._v4_layout_timing_lock = threading.Lock()
+    if not hasattr(translate_thread, '_v4_layout_timings'):
+        translate_thread._v4_layout_timings = {}
+
+    # Standalone re-layout suppresses other saves. During a pipeline, saves use
+    # the same project lock as layout mutations.
     _HEADLESS_SAVE_IN_PROGRESS = True
     
     # Initialize layout timer for headless save
@@ -4397,12 +4760,15 @@ def _v4_headless_save_entry(translate_thread, proj=None):
             if LOGGER: LOGGER.error("❌ V4 Save: Project not found.")
             return
 
+        if not hasattr(proj, '_v4_save_lock'):
+            proj._v4_save_lock = threading.RLock()
+
         # --- DEBOUNCE LOGIC (Prevent Double Saves) ---
         import time
         current_time = time.time()
         last_save = getattr(proj, '_last_v4_save_timestamp', 0)
         # Skip if saved less than 5 seconds ago
-        if current_time - last_save < 5.0:
+        if not wait_for_pipeline and current_time - last_save < 5.0:
             if LOGGER: LOGGER.info(f"Skipping redundant save request (Debounce: {current_time - last_save:.2f}s ago)")
             return
         proj._last_v4_save_timestamp = current_time
@@ -4412,7 +4778,13 @@ def _v4_headless_save_entry(translate_thread, proj=None):
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        img_keys_list = list(proj.pages.keys())
+        img_keys_list = [k for k in proj.pages.keys() if not proj._image_info.get(k, {}).get('corrupted', False)]
+
+        parent_obj = translate_thread.parent() if callable(getattr(translate_thread, 'parent', None)) else None
+        selected_pages = getattr(parent_obj, 'pages_to_process', None)
+        if selected_pages:
+            selected_set = set(selected_pages)
+            img_keys_list = [k for k in img_keys_list if k in selected_set]
 
         # [Repair Mode] Only process pages that were repaired
         if _V4_REPAIR_MODE and _V4_REPAIR_PAGES is not None:
@@ -4424,6 +4796,7 @@ def _v4_headless_save_entry(translate_thread, proj=None):
         if LOGGER: LOGGER.info(f"Target: {total_pages} pages. Output: {output_dir}")
 
         # Pass 'proj' to UIHelper so it can load data on Main Thread
+        ui_helper = None
         if mainwindow:
             msgbox = None
             if hasattr(mainwindow, 'imgtrans_progress_msgbox'):
@@ -4446,20 +4819,49 @@ def _v4_headless_save_entry(translate_thread, proj=None):
             # Fallback if no UI (shouldn't happen)
             _pipeline_start = getattr(translate_thread, '_v4_pipeline_start_time', None)
             ui_helper = UIHelper(None, proj, total_pages=total_pages, pipeline_start_time=_pipeline_start)
+
+        if ui_helper is None:
+            _pipeline_start = getattr(translate_thread, '_v4_pipeline_start_time', None)
+            ui_helper = UIHelper(
+                None,
+                proj,
+                getattr(mainwindow, 'st_manager', None) if mainwindow else None,
+                total_pages=total_pages,
+                pipeline_start_time=_pipeline_start,
+            )
+            if mainwindow:
+                ui_helper.moveToThread(mainwindow.thread())
+            translate_thread._ui_helper = ui_helper
         
         # 3. Headless Render Function (Background Thread - Stable)
         def process_page_hybrid(page_key):
+            prepared_stored = False
             try:
+                if not _claim_v4_layout_page(translate_thread, page_key):
+                    if LOGGER:
+                        LOGGER.warning(f"Duplicate layout request ignored for {page_key}.")
+                    return True
+
+                # [손상된 이미지 스킵] corrupted 플래그 설정된 페이지는 렌더링/저장 즉시 스킵
+                if proj and proj._image_info.get(page_key, {}).get('corrupted', False):
+                    if LOGGER: LOGGER.warning(f"Pre-flight check skipped corrupted image '{page_key}'. Skipping save.")
+                    _set_v4_layout_state(translate_thread, page_key, 'failed')
+                    return False
+
                 # [페이지별 인페인트 대기] 이 페이지의 인페인트가 완료될 때까지 기다림.
                 # 전체 인페인트 완료를 기다리는 대신 페이지 단위로 대기하여
                 # 번역이 끝나는 즉시 레이아웃을 시작할 수 있도록 함.
-                if pcfg and pcfg.module and pcfg.module.enable_inpaint and RunStatus is not None:
+                if not wait_for_pipeline and pcfg and pcfg.module and pcfg.module.enable_inpaint and RunStatus is not None:
                     _inpaint_max_wait = 3600  # 1시간 타임아웃
                     _inpaint_wait_start = time.time()
                     _inpaint_last_log = _inpaint_wait_start
                     while True:
                         try:
-                            _finish_code = translate_thread.imgtrans_proj._image_info.get(page_key, {}).get('finish_code', 0)
+                            _info = translate_thread.imgtrans_proj._image_info.get(page_key, {})
+                            if _info.get('corrupted', False):
+                                if LOGGER: LOGGER.warning(f"Skipping inpaint wait for corrupted image: {page_key}")
+                                return False
+                            _finish_code = _info.get('finish_code', 0)
                             if _finish_code & RunStatus.FIN_INPAINT:
                                 break
                         except Exception:
@@ -4473,6 +4875,56 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                             if LOGGER: LOGGER.info(f"⏳ 인페인트 대기 중: {page_key} ({_waited}초 경과)")
                             _inpaint_last_log = _now
                         time.sleep(0.5)
+
+                wait_started = time.time()
+                last_wait_log = wait_started
+                while True:
+                    readiness = _layout_page_readiness(
+                        translate_thread,
+                        page_key,
+                        wait_for_pipeline,
+                    )
+                    if readiness == 'ready':
+                        break
+                    if readiness in ('failed', 'cancelled'):
+                        _set_v4_layout_state(translate_thread, page_key, readiness)
+                        if LOGGER and readiness == 'failed':
+                            LOGGER.error(f"Layout prerequisites failed for {page_key}; page was not saved.")
+                        return False
+                    now = time.time()
+                    if now - wait_started > 3600:
+                        _set_v4_layout_state(translate_thread, page_key, 'failed')
+                        if LOGGER:
+                            LOGGER.error(f"Layout prerequisite timeout for {page_key}; page was not saved.")
+                        return False
+                    if now - last_wait_log >= 10:
+                        if LOGGER:
+                            LOGGER.info(
+                                f"Layout waiting for OCR/translation/inpaint: {page_key} "
+                                f"({int(now - wait_started)}s)"
+                            )
+                        last_wait_log = now
+                    time.sleep(0.2)
+
+                _set_v4_layout_state(translate_thread, page_key, 'preparing')
+                prepared_page = _prepare_layout_page(
+                    proj,
+                    page_key,
+                    bool(ui_helper.stm and pcfg.let_autolayout_flag),
+                )
+                with ui_helper.prepared_pages_lock:
+                    ui_helper.prepared_pages[page_key] = prepared_page
+                prepared_stored = True
+                _add_v4_layout_timing(
+                    translate_thread,
+                    'area_prepare',
+                    prepared_page['prepare_seconds'],
+                )
+                _autolayout_detail_log(
+                    'debug',
+                    f"[Layout/prepare] {page_key} "
+                    f"({prepared_page['prepare_seconds']:.3f}s)",
+                )
 
                 # Use invokeMethod to run render_page_task on Main Thread (Blocking)
                 # This ensures we use the exact same rendering logic (TextBlkItem) as the GUI
@@ -4489,30 +4941,39 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 _V4_SAVE_HEARTBEAT = time.time()
                 _V4_SAVE_HEARTBEAT_INFO = f"invoke->render:{page_key}"
                 _invoke_t0 = time.time()
-                if LOGGER: LOGGER.debug(f"[Save/invoke->] {page_key}")
+                _set_v4_layout_state(translate_thread, page_key, 'rendering')
+                _autolayout_detail_log('debug', f"[Save/invoke->] {page_key}")
                 QMetaObject.invokeMethod(
                     ui_helper,
                     "render_page_task",
                     Qt.BlockingQueuedConnection,
                     Q_ARG(str, page_key)
                 )
+                prepared_stored = False
                 _V4_SAVE_HEARTBEAT = time.time()
                 _invoke_elapsed = _V4_SAVE_HEARTBEAT - _invoke_t0
+                _render_elapsed = ui_helper.render_timings.pop(page_key, _invoke_elapsed)
+                _add_v4_layout_timing(translate_thread, 'qt_render', _render_elapsed)
                 if LOGGER:
-                    LOGGER.debug(f"[Save/invoke/ok] {page_key} ({_invoke_elapsed:.2f}s)")
                     if _invoke_elapsed > 30:
                         LOGGER.warning(
                             f"[Save/invoke] Slow render: {page_key} took {_invoke_elapsed:.1f}s"
                         )
+                _autolayout_detail_log(
+                    'debug',
+                    f"[Save/invoke/ok] {page_key} ({_invoke_elapsed:.2f}s)",
+                )
 
                 # Retrieve result
                 result_image = ui_helper.rendered_images.pop(page_key, None)
 
                 if result_image is None or result_image.isNull():
                     if LOGGER: LOGGER.warning(f"Main thread returned null image for {page_key}")
+                    _set_v4_layout_state(translate_thread, page_key, 'failed')
                     return False
 
                 # 2. Save File (Background Thread - Slow I/O)
+                _set_v4_layout_state(translate_thread, page_key, 'saving')
                 ext = getattr(pcfg, 'imgsave_ext', '.png')
                 if not ext.startswith('.'): ext = '.' + ext
                 
@@ -4522,7 +4983,14 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 if hasattr(pcfg, 'imgsave_quality') and pcfg.imgsave_quality is not None:
                     quality = int(pcfg.imgsave_quality)
                 
-                result_image.save(save_path, quality=quality)
+                save_started = time.perf_counter()
+                if not result_image.save(save_path, quality=quality):
+                    raise RuntimeError(f"QImage save failed: {save_path}")
+                _add_v4_layout_timing(
+                    translate_thread,
+                    'image_save',
+                    time.perf_counter() - save_started,
+                )
         
                 # [메모리 강화] sip.delete로 Qt C++ 메모리 즉시 해제
                 try:
@@ -4531,13 +4999,19 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 except Exception:
                     del result_image
                 
+                _set_v4_layout_state(translate_thread, page_key, 'completed')
                 return True
                 
             except Exception as e:
+                _set_v4_layout_state(translate_thread, page_key, 'failed')
                 if LOGGER: LOGGER.error(f"Hybrid Save failed for {page_key}: {e}")
                 import traceback
                 if LOGGER: LOGGER.error(traceback.format_exc())
                 return False
+            finally:
+                if prepared_stored and ui_helper is not None:
+                    with ui_helper.prepared_pages_lock:
+                        ui_helper.prepared_pages.pop(page_key, None)
 
         # 4. Execute Parallel Rendering
         signaler.progress_signal.emit(0, " (저장 시작...)")
@@ -4606,6 +5080,7 @@ def _v4_headless_save_entry(translate_thread, proj=None):
         _watchdog_thread.start()
 
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        failed_pages = []
         try:
             futures = {executor.submit(process_page_hybrid, key): key for key in img_keys_list}
             
@@ -4615,8 +5090,10 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 time.sleep(0.02)
                 
                 try:
-                    future.result()
+                    if not future.result():
+                        failed_pages.append(futures[future])
                 except Exception as e:
+                    failed_pages.append(futures[future])
                     if LOGGER: LOGGER.error(f"Background save task failed: {e}")
                 
                 completed += 1
@@ -4643,13 +5120,20 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 else:
                     signaler.progress_signal.emit(percent, f" (저장 중: {completed}/{total_pages})")
         finally:
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=True)
             # Stop the watchdog thread; daemon, so it will also die with the process.
             try:
                 if _V4_WATCHDOG_STOP is not None:
                     _V4_WATCHDOG_STOP.set()
             except Exception:
                 pass
+
+        translate_thread._v4_layout_failed_pages = set(failed_pages)
+        if failed_pages and LOGGER:
+            LOGGER.error(
+                f"V4 layout/save failed for {len(failed_pages)} page(s): "
+                f"{', '.join(failed_pages[:10])}"
+            )
                     
         # 5. Log total elapsed time and finish
         _start = getattr(translate_thread, '_v4_pipeline_start_time', None)
@@ -4666,14 +5150,33 @@ def _v4_headless_save_entry(translate_thread, proj=None):
             if LOGGER:
                 LOGGER.info(f"📊 총 작업시간: {elapsed_str}")
 
-        signaler.finished_signal.emit()
-        if LOGGER: LOGGER.info("✅ V4: Hybrid Background Save Complete.")
+        timings = getattr(translate_thread, '_v4_layout_timings', {})
+        if LOGGER:
+            LOGGER.info(
+                "V4 stage totals: "
+                f"area_prepare={timings.get('area_prepare', 0.0):.2f}s, "
+                f"qt_render={timings.get('qt_render', 0.0):.2f}s, "
+                f"image_save={timings.get('image_save', 0.0):.2f}s"
+            )
+
+        translate_thread._v4_save_completed = not failed_pages and not _V4_STOP_REQUESTED
+        if _V4_STOP_REQUESTED:
+            signaler.progress_signal.emit(0, " (저장 중단됨)")
+            if LOGGER:
+                LOGGER.warning("V4 incremental layout/save stopped; pending page data was cleared.")
+        elif failed_pages:
+            signaler.progress_signal.emit(100, f" (저장 실패: {len(failed_pages)}페이지)")
+        else:
+            signaler.finished_signal.emit()
+            if LOGGER:
+                LOGGER.info("✅ V4: Hybrid Background Save Complete.")
         
         # Reset flag to allow normal saves again
         _HEADLESS_SAVE_IN_PROGRESS = False
 
     except Exception as e:
         import traceback
+        translate_thread._v4_layout_save_error = e
         err = f"🚨 V4 Save Critical Error: {e}\n{traceback.format_exc()}"
         if LOGGER: LOGGER.error(err)
         print(err)
@@ -4687,12 +5190,17 @@ def _v4_headless_save_entry(translate_thread, proj=None):
                 _V4_WATCHDOG_STOP.set()
         except Exception:
             pass
+        helper = getattr(translate_thread, '_ui_helper', None)
+        if helper is not None and hasattr(helper, 'prepared_pages_lock'):
+            with helper.prepared_pages_lock:
+                helper.prepared_pages.clear()
 
 def _run_translate_pipeline_patched(self):
     """
     Monkey patched version with save-throttling and global lock protection.
     """
     global _V4_GUI_LAYOUT_ENABLED, _PIPELINE_ACTIVE, _V4_LAYOUT_START_TIME, _V4_LAYOUT_COMPLETED_COUNT
+    global _V4_AUTOLAYOUT_DETAIL_LOGGING
     
     # Initialize layout progress tracking for this pipeline run
     _V4_LAYOUT_START_TIME = time.time()
@@ -4718,6 +5226,8 @@ def _run_translate_pipeline_patched(self):
         if prev_helper is not None:
             if hasattr(prev_helper, 'rendered_images'):
                 prev_helper.rendered_images.clear()
+            if hasattr(prev_helper, 'render_timings'):
+                prev_helper.render_timings.clear()
             if hasattr(prev_helper, 'tray'):
                 try:
                     prev_helper.tray.hide()
@@ -4761,10 +5271,37 @@ def _run_translate_pipeline_patched(self):
     # Initialize flags for suppression and debouncing
     _V4_GUI_LAYOUT_ENABLED = False
     _PIPELINE_ACTIVE = True
+    _V4_AUTOLAYOUT_DETAIL_LOGGING = bool(
+        getattr(self.translator, 'autolayout_detail_logging', False)
+    )
+    self._v4_layout_state_lock = threading.Lock()
+    self._v4_layout_states = {}
+    self._v4_layout_timing_lock = threading.Lock()
+    self._v4_layout_timings = {}
+    self._v4_translated_pages = set()
+    self._v4_translation_failed_pages = set()
+    if not hasattr(self, '_v4_inpaint_failed_pages'):
+        self._v4_inpaint_failed_pages = set()
+    self._v4_layout_failed_pages = set()
+    self._v4_save_completed = False
+    if not hasattr(self.imgtrans_proj, '_v4_save_lock'):
+        self.imgtrans_proj._v4_save_lock = threading.RLock()
+    layout_thread = None
     
     try:
+        global _V4_STOP_REQUESTED
+        _V4_STOP_REQUESTED = False
         if LOGGER:
             LOGGER.info(f"🚀 V4 Parallel Processing: {target_num_pages} pages, {self.translator.concurrent_images} workers.")
+
+        layout_thread = threading.Thread(
+            target=_v4_headless_save_entry,
+            args=(self,),
+            kwargs={'wait_for_pipeline': True},
+            name='V4IncrementalLayoutSave',
+            daemon=True,
+        )
+        layout_thread.start()
 
         max_workers = getattr(self.translator, 'concurrent_images', 3)
         save_interval = getattr(self.translator, 'save_interval', 3.0)
@@ -4779,11 +5316,16 @@ def _run_translate_pipeline_patched(self):
             futures = {}
             
             while local_completed_count < target_num_pages:
-                if self.stop_requested:
+                if self.stop_requested or _V4_STOP_REQUESTED:
+                    _V4_STOP_REQUESTED = True
                     self.module_thread_stopped.emit()
                     self.stop_requested = False
                     for f in futures:
                         f.cancel()
+                    try:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        executor.shutdown(wait=False)
                     break
 
                 if not has_started:
@@ -4827,6 +5369,8 @@ def _run_translate_pipeline_patched(self):
                                 self.progress_changed.emit(self.finished_counter)
                             
                             self.imgtrans_proj.update_page_progress(page_key, RunStatus.FIN_TRANSLATE)
+                            with self._v4_layout_state_lock:
+                                self._v4_translated_pages.add(page_key)
                             completed_pages.append(page_key)
                             
                             current_time = time.time()
@@ -4860,6 +5404,8 @@ def _run_translate_pipeline_patched(self):
                                         completed_pages.clear()
                                         last_save_time = current_time
                     else:
+                        with self._v4_layout_state_lock:
+                            self._v4_translation_failed_pages.add(page_key)
                         if local_completed_count < target_num_pages:
                             self.finished_counter += 1
                             self.progress_changed.emit(self.finished_counter)
@@ -4885,29 +5431,41 @@ def _run_translate_pipeline_patched(self):
                             if LOGGER: LOGGER.info(f"📊 GC @{local_completed_count}/{target_num_pages} pages")
 
         # --- ALL PAGES TRANSLATED ---
-        # 인페인트 완료를 전체 기다리지 않고 즉시 레이아웃/저장 시작.
-        # 각 페이지별 인페인트 대기는 process_page_hybrid 내부에서 처리.
         if LOGGER:
-            LOGGER.info(f"All {target_num_pages} pages translated. Starting layout immediately (per-page inpaint wait in render)...")
+            LOGGER.info(
+                f"Translation stage finished for {target_num_pages} pages; "
+                "waiting for incremental layout/save queue."
+            )
 
-        # FINAL BATCH SAVE WITH LAYOUT
-        # Restore GUI layout ability BEFORE the final batch layout/save
+        if layout_thread is not None:
+            layout_thread.join()
         _V4_GUI_LAYOUT_ENABLED = True
-        _v4_headless_save_entry(self)
-        
+
+        layout_error = getattr(self, '_v4_layout_save_error', None)
+        if layout_error is not None:
+            raise RuntimeError("Incremental layout/save queue failed") from layout_error
+
+        # One authoritative project JSON save after every layout worker has stopped.
         with _GLOBAL_SAVE_LOCK:
-            self.finished_counter = target_num_pages
-            self.progress_changed.emit(self.finished_counter)
+            self.imgtrans_proj.save(_v4_force=True)
+            if not _V4_STOP_REQUESTED:
+                self.finished_counter = target_num_pages
+                self.progress_changed.emit(self.finished_counter)
             if LOGGER:
-                LOGGER.info(f"Pipeline counter released to {target_num_pages}. All done.")
+                LOGGER.info("Incremental layout queue drained; final project save completed.")
 
     except Exception as e:
+        _V4_STOP_REQUESTED = True
         if LOGGER:
             LOGGER.error(f"Critical error in translation pipeline: {e}")
             LOGGER.error(traceback.format_exc())
     finally:
         # [메모리 수정] 파이프라인 완료 후 강화된 정리 루틴
         import gc
+
+        if layout_thread is not None and layout_thread.is_alive():
+            _V4_STOP_REQUESTED = True
+            layout_thread.join()
         
         # 1. UIHelper 내부 Qt 객체 명시적 해제
         try:
@@ -4916,6 +5474,11 @@ def _run_translate_pipeline_patched(self):
                 # rendered_images dict 비우기
                 if hasattr(_helper, 'rendered_images'):
                     _helper.rendered_images.clear()
+                if hasattr(_helper, 'render_timings'):
+                    _helper.render_timings.clear()
+                if hasattr(_helper, 'prepared_pages_lock'):
+                    with _helper.prepared_pages_lock:
+                        _helper.prepared_pages.clear()
                 # QSystemTrayIcon 해제
                 if hasattr(_helper, 'tray'):
                     try:

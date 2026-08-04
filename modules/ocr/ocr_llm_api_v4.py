@@ -16,7 +16,6 @@ import cv2
 import numpy as np
 import threading
 from typing import List, Optional
-import queue
 import concurrent.futures
 
 import openai
@@ -35,6 +34,15 @@ class TaskRunner(QObject):
 
     def run(self):
         self.task()
+
+
+def _should_run_page_ocr(enable_ocr, repair_mode, blk_list):
+    """Return whether this page should enter OCR in the current pipeline run."""
+    if not enable_ocr:
+        return False
+    if not repair_mode:
+        return True
+    return any(getattr(blk, '_v4_needs_ocr', False) for blk in blk_list)
 
 @register_OCR("llm_ocr_v4")
 class LLM_OCR_V4(OCRBase):
@@ -186,7 +194,13 @@ class LLM_OCR_V4(OCRBase):
         },
         "manga_ocr_workers": {
             "value": 4,
-            "description": "로컬 MangaOCR 모드에서 동시에 사용할 모델 인스턴스 수입니다. VRAM을 약 300MB × 인스턴스 수만큼 사용합니다.",
+            "display_name": "로컬 OCR GPU 워커 수",
+            "description": "로컬 MangaOCR 모드에서 동시에 사용할 GPU 모델 인스턴스 수입니다. 배치 크기 1에서는 기존 방식과 같습니다.",
+        },
+        "manga_ocr_batch_size": {
+            "value": 1,
+            "display_name": "로컬 OCR 워커당 배치 크기",
+            "description": "GPU 모델 인스턴스 하나가 한 번의 generate 호출로 처리할 말풍선 이미지 수입니다. 1은 기존 방식과 호환됩니다.",
         },
         "initial_buffer_pages": {
             "value": 20,
@@ -202,6 +216,12 @@ class LLM_OCR_V4(OCRBase):
             "value": "없음",
             "display_name": "응답 암호화",
             "description": "LLM이 OCR 결과를 지정된 방식으로 인코딩하여 반환하도록 지시하고, 수신 후 자동으로 복호화합니다.",
+        },
+        "enable_prefill": {
+            "type": "checkbox",
+            "value": True,
+            "display_name": "구조화 프리필 사용",
+            "description": "OCR 모드에서 모델 응답 형식을 유도하기 위한 프리필(Response type: csv...) 메시지 추가 여부를 설정합니다.",
         },
         "inpaint_parallel_workers": {
             "value": 2,
@@ -227,9 +247,10 @@ class LLM_OCR_V4(OCRBase):
         self.fallback_ocr = None  # MangaOCR fallback instance (single, for API fallback)
         self.use_page_batching = True  # Enable async pipeline batching
 
-        # Multi-instance MangaOCR pool for parallel local OCR
-        self._manga_ocr_pool = None  # Queue of MangaOCR instances
-        self._manga_ocr_pool_size = 0
+        # Persistent cross-page MangaOCR batch scheduler.
+        self._manga_ocr_scheduler = None
+        self._manga_ocr_scheduler_lock = threading.Lock()
+        self._manga_ocr_pool_size = 0  # Compatibility/debug surface: active GPU workers
 
         # Thread-Local Storage: Each thread gets its own HTTP client
         self._thread_local = threading.local()
@@ -486,7 +507,12 @@ class LLM_OCR_V4(OCRBase):
     @property
     def manga_ocr_workers(self) -> int:
         val = self.get_param_value("manga_ocr_workers")
-        return int(val) if val != "" else 4
+        return max(1, int(val)) if val != "" else 4
+
+    @property
+    def manga_ocr_batch_size(self) -> int:
+        val = self.get_param_value("manga_ocr_batch_size")
+        return max(1, int(val)) if val != "" else 1
 
     @property
     def initial_buffer_pages(self) -> int:
@@ -511,6 +537,13 @@ class LLM_OCR_V4(OCRBase):
     def debug_profiling(self) -> bool:
         val = self.get_param_value("debug_profiling")
         return bool(val) if val != "" else False
+
+    @property
+    def enable_prefill(self) -> bool:
+        val = self.get_param_value("enable_prefill")
+        if isinstance(val, str):
+            return val.lower().strip() == 'true'
+        return bool(val) if val is not None else True
 
     # --- 암호화 헬퍼 메서드 ---
     @staticmethod
@@ -732,46 +765,86 @@ class LLM_OCR_V4(OCRBase):
             return None
 
     def _ensure_manga_ocr_pool(self):
-        """Initialize the multi-instance MangaOCR pool for parallel local OCR."""
-        target_size = self.manga_ocr_workers
-        if self._manga_ocr_pool is not None and self._manga_ocr_pool_size == target_size:
-            return  # Already initialized with correct size
+        """Initialize or reconfigure the persistent cross-page MangaOCR scheduler."""
+        target_workers = self.manga_ocr_workers
+        target_batch_size = self.manga_ocr_batch_size
+        scheduler = self._manga_ocr_scheduler
+        if scheduler is not None and scheduler.is_compatible(target_workers, target_batch_size):
+            scheduler.debug = self.debug_profiling
+            return scheduler
 
-        from .ocr_manga import MangaOCR
+        with self._manga_ocr_scheduler_lock:
+            scheduler = self._manga_ocr_scheduler
+            if scheduler is not None and scheduler.is_compatible(target_workers, target_batch_size):
+                scheduler.debug = self.debug_profiling
+                return scheduler
 
-        self.logger.info(f"🚀 Initializing MangaOCR pool with {target_size} instances (device=cuda)...")
-        self._manga_ocr_pool = queue.Queue()
-        self._manga_ocr_pool_size = target_size
+            if scheduler is not None:
+                scheduler.shutdown(wait=True)
+                self._manga_ocr_scheduler = None
+                self._manga_ocr_pool_size = 0
+                del scheduler
+                import gc
+                gc.collect()
+                try:
+                    import torch
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-        for i in range(target_size):
-            instance = MangaOCR(device={'type': 'selector', 'options': ['cuda', 'cpu'], 'value': 'cuda'})
-            if not instance.all_model_loaded():
-                instance.load_model()
-            self._manga_ocr_pool.put(instance)
-            self.logger.info(f"  ✅ MangaOCR instance {i+1}/{target_size} loaded")
+            from .ocr_manga import MangaOCR, MangaOCRBatchScheduler
 
-        self.logger.info(f"🟢 MangaOCR pool ready: {target_size} instances")
+            self.logger.info(
+                f"🚀 Initializing MangaOCR scheduler: {target_workers} GPU worker(s), "
+                f"batch size {target_batch_size} (device=cuda)..."
+            )
 
-    def _acquire_manga_ocr(self):
-        """Acquire a MangaOCR instance from the pool (blocks until available)."""
-        return self._manga_ocr_pool.get()
+            def _model_factory():
+                return MangaOCR(
+                    device={'type': 'selector', 'options': ['cuda', 'cpu'], 'value': 'cuda'}
+                )
 
-    def _release_manga_ocr(self, instance):
-        """Return a MangaOCR instance to the pool."""
-        self._manga_ocr_pool.put(instance)
+            scheduler = MangaOCRBatchScheduler(
+                model_factory=_model_factory,
+                worker_count=target_workers,
+                batch_size=target_batch_size,
+                batch_wait_ms=10,
+                logger=self.logger,
+                debug=self.debug_profiling,
+            )
+            self._manga_ocr_scheduler = scheduler
+            self._manga_ocr_pool_size = target_workers
+            self.logger.info(
+                f"🟢 MangaOCR scheduler ready: {target_workers}×{target_batch_size} "
+                f"(up to {target_workers * target_batch_size} crops per dispatch wave)"
+            )
+            return scheduler
 
-    def _ocr_with_manga_instance(self, instance, raw_img: np.ndarray) -> str:
-        """Run OCR on a raw image using a specific MangaOCR instance."""
-        try:
-            img_rgb = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
-            result = instance.ocr_img(img_rgb)
-            del img_rgb
-            if result and result.strip():
-                return result
-            return ""
-        except Exception as e:
-            self.logger.error(f"MangaOCR instance OCR failed: {e}")
-            return ""
+    def _shutdown_manga_ocr_scheduler(self):
+        """Release persistent local OCR workers after a configuration change."""
+        scheduler_lock = getattr(self, '_manga_ocr_scheduler_lock', None)
+        if scheduler_lock is None:
+            return
+        with scheduler_lock:
+            scheduler = getattr(self, '_manga_ocr_scheduler', None)
+            self._manga_ocr_scheduler = None
+            self._manga_ocr_pool_size = 0
+            if scheduler is not None:
+                scheduler.shutdown(wait=True)
+
+    def unload_model(self, empty_cache=False):
+        had_scheduler = getattr(self, '_manga_ocr_scheduler', None) is not None
+        self._shutdown_manga_ocr_scheduler()
+        model_deleted = super().unload_model(empty_cache=False)
+        if empty_cache and (had_scheduler or model_deleted):
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        return had_scheduler or model_deleted
 
     def _ocr_with_retry(self, img_base64: str, prompt_override: str = None, model_override: str = None, retry_override: int = None) -> str:
         """
@@ -1076,12 +1149,15 @@ class LLM_OCR_V4(OCRBase):
             {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": safety_threshold},
         ]
 
+        contents = [
+            {"role": "user", "parts": [{"text": prompt_text}]},
+            {"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": prompt_text}]},
-                {"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]},
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
@@ -1207,11 +1283,14 @@ class LLM_OCR_V4(OCRBase):
             {"category": "HARM_CATEGORY_CIVIC_INTEGRITY", "threshold": safety_threshold},
         ]
 
+        contents = [
+            {"role": "user", "parts": parts},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": parts},
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
@@ -1356,12 +1435,15 @@ class LLM_OCR_V4(OCRBase):
         # Turn 2: User (image)
         # Turn 3: Model (CSV header priming - censorship bypass)
         
+        contents = [
+            {"role": "user", "parts": [{"text": prompt_text}]},
+            {"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": prompt_text}]},
-                {"role": "user", "parts": [{"inline_data": {"mime_type": "image/jpeg", "data": img_base64}}]},
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
@@ -1490,12 +1572,14 @@ class LLM_OCR_V4(OCRBase):
         ]
 
         # Payload with Prefill
+        contents = [
+            {"role": "user", "parts": parts},
+        ]
+        if self.enable_prefill:
+            contents.append({"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]})
+
         payload = {
-            "contents": [
-                {"role": "user", "parts": parts},
-                # Prefill to force CSV format
-                {"role": "model", "parts": [{"text": 'Response type: csv\n"id","text"'}]}
-            ],
+            "contents": contents,
             "generationConfig": generation_config,
             "safetySettings": safety_settings
         }
@@ -1735,38 +1819,34 @@ class LLM_OCR_V4(OCRBase):
         # MangaOCR 로컬 전용 모드: 다중 인스턴스 병렬 처리
 
         if self.use_manga_ocr_local:
-            self._ensure_manga_ocr_pool()
-            num_workers = self._manga_ocr_pool_size
+            scheduler = self._ensure_manga_ocr_pool()
 
-            # Prepare valid blocks and their regions
+            # Submit every crop to one persistent queue shared across pages.
+            # Each GPU worker collects up to manga_ocr_batch_size crops and
+            # executes one true batched model.generate() call.
             valid_blks = []
-            regions = []
+            futures = []
             for blk in blk_list:
                 x1, y1, x2, y2 = blk.xyxy
                 if 0 <= x1 < x2 <= im_w and 0 <= y1 < y2 <= im_h:
                     valid_blks.append(blk)
-                    regions.append(img[y1:y2, x1:x2].copy())
+                    region_rgb = cv2.cvtColor(
+                        img[y1:y2, x1:x2],
+                        cv2.COLOR_BGR2RGB,
+                    )
+                    futures.append(scheduler.submit(region_rgb))
                 else:
                     blk.text = ""
 
             if not valid_blks:
                 return
 
-            def _process_block(idx):
-                instance = self._acquire_manga_ocr()
+            for blk, future in zip(valid_blks, futures):
                 try:
-                    return idx, self._ocr_with_manga_instance(instance, regions[idx])
-                finally:
-                    self._release_manga_ocr(instance)
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = [executor.submit(_process_block, i) for i in range(len(valid_blks))]
-                for future in concurrent.futures.as_completed(futures):
-                    idx, text = future.result()
-                    valid_blks[idx].text = text
-
-            # Release region references
-            regions.clear()
+                    blk.text = future.result()
+                except Exception as e:
+                    self.logger.error(f"MangaOCR batched inference failed: {e}")
+                    blk.text = ""
             return
 
         valid_blks = []
@@ -1908,6 +1988,8 @@ class LLM_OCR_V4(OCRBase):
 
     def updateParam(self, param_key: str, param_content):
         super().updateParam(param_key, param_content)
+        if param_key in ["manga_ocr_workers", "manga_ocr_batch_size"]:
+            self._shutdown_manga_ocr_scheduler()
         if param_key in ["api_key", "multiple_keys", "endpoint", "proxy", "provider", "request_timeout", "ocr_parallel_workers"]:
             self.client = None
             if self.http_client:
@@ -2036,6 +2118,9 @@ def _apply_chunked_processing_patch():
                     valid_pages.append(p)
                 except Exception as e:
                     if LOGGER: LOGGER.warning(f"Pre-flight check: Skipping corrupted image '{p}' ({e})")
+                    self.imgtrans_proj._image_info.setdefault(p, {})['corrupted'] = True
+                    if hasattr(self.imgtrans_proj, 'update_page_progress') and RunStatus is not None:
+                        self.imgtrans_proj.update_page_progress(p, RunStatus.FIN_INPAINT)
             
             pages_to_iterate = valid_pages
             
@@ -2053,6 +2138,19 @@ def _apply_chunked_processing_patch():
             self.inpaint_thread.num_process_pages = self.num_pages
             self.translate_thread.num_process_pages = self.num_pages
 
+            # Completion flags persist in the project JSON. Clear only the stages
+            # selected for this run so incremental layout never mistakes an old run
+            # for a page that is currently ready.
+            current_run_mask = RunStatus.FIN_TRANSLATE
+            if cfg_module.enable_ocr:
+                current_run_mask |= RunStatus.FIN_OCR
+            if cfg_module.enable_inpaint:
+                current_run_mask |= RunStatus.FIN_INPAINT
+            for page_name in pages_to_iterate:
+                page_info = self.imgtrans_proj._image_info.setdefault(page_name, {})
+                page_info['finish_code'] = page_info.get('finish_code', 0) & ~current_run_mask
+            self.translate_thread._v4_inpaint_failed_pages = set()
+
             low_vram_trans = False
             if self.translator is not None:
                 low_vram_trans = self.translator.low_vram_mode
@@ -2065,10 +2163,13 @@ def _apply_chunked_processing_patch():
 
             # --- ASYNC LOGIC ---
             # Respect user UI settings from the OCR module
-            # Local MangaOCR mode: use manga_ocr_workers for page-level parallelism too
-            # (the shared Queue pool naturally limits concurrent GPU inference to N instances)
+            # Local MangaOCR uses several page producers to keep the persistent
+            # cross-page GPU batch queue full. GPU concurrency itself is limited
+            # by manga_ocr_workers inside the scheduler.
             if getattr(self.ocr, 'use_manga_ocr_local', False):
-                ocr_workers = getattr(self.ocr, 'manga_ocr_workers', 4)
+                gpu_workers = getattr(self.ocr, 'manga_ocr_workers', 4)
+                local_batch_size = getattr(self.ocr, 'manga_ocr_batch_size', 1)
+                ocr_workers = max(gpu_workers, min(local_batch_size, 8))
             else:
                 ocr_workers = getattr(self.ocr, 'ocr_parallel_workers', 50)
             buffer_pages = getattr(self.ocr, 'initial_buffer_pages', 20)
@@ -2095,7 +2196,13 @@ def _apply_chunked_processing_patch():
 
             # OCR Executor (Background Thread)
             if LOGGER:
-                LOGGER.info(f"🚀 Async Pipeline: Using {ocr_workers} OCR workers as per settings.")
+                if getattr(self.ocr, 'use_manga_ocr_local', False):
+                    LOGGER.info(
+                        f"🚀 Async Pipeline: {ocr_workers} page producer(s), "
+                        f"MangaOCR {gpu_workers}×{local_batch_size}."
+                    )
+                else:
+                    LOGGER.info(f"🚀 Async Pipeline: Using {ocr_workers} OCR workers as per settings.")
             ocr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=ocr_workers)
             ocr_futures = []
 
@@ -2164,6 +2271,15 @@ def _apply_chunked_processing_patch():
                     self.imgtrans_proj.save_inpainted(imgname_arg, inpainted)
                     del inpainted
                 except Exception as e:
+                    layout_lock = getattr(self.translate_thread, '_v4_layout_state_lock', None)
+                    if layout_lock is not None:
+                        with layout_lock:
+                            self.translate_thread._v4_inpaint_failed_pages.add(imgname_arg)
+                    else:
+                        self.translate_thread._v4_inpaint_failed_pages = set(
+                            getattr(self.translate_thread, '_v4_inpaint_failed_pages', set())
+                        )
+                        self.translate_thread._v4_inpaint_failed_pages.add(imgname_arg)
                     if debug_prof and 'inpaint' in (phase_counters or {}):
                         # Ensure phase counter stays balanced on error
                         try:
@@ -2207,25 +2323,54 @@ def _apply_chunked_processing_patch():
                     if LOGGER:
                         LOGGER.info(f"🔵 OCR START: [{imgname_arg}] at {ocr_start_time}")
                     
-                    # Read fresh data with retry on decoder/memory failure
-                    img_ocr = None
-                    for _attempt in range(2):
-                        try:
-                            img_ocr = self.imgtrans_proj.read_img(imgname_arg)
-                            break
-                        except (OSError, MemoryError) as e:
-                            if _attempt == 0:
-                                import gc; gc.collect()
-                                if LOGGER: LOGGER.warning(f"Image load retry for {imgname_arg} after gc: {e}")
-                            else:
-                                if LOGGER: LOGGER.error(f"Image load failed permanently for {imgname_arg}: {e}")
-                    if img_ocr is None:
-                        if LOGGER: LOGGER.warning(f"⚠️ Skipping unreadable image: {imgname_arg}")
-                        skipped_files.append(imgname_arg)
-                        return
                     blk_list_ocr = self.imgtrans_proj.pages[imgname_arg]
+
+                    # Repair runs can contain both OCR-needed and translation-only pages.
+                    # Use one page-level decision for both image loading and OCR dispatch so
+                    # a translation-only page never reaches OCRBase.run_ocr(img=None, ...).
+                    repair_mode = False
+                    try:
+                        import sys as _sys
+                        _tm = _sys.modules.get('modules.translators.trans_llm_api_v4')
+                        repair_mode = bool(_tm and getattr(_tm, '_V4_REPAIR_MODE', False))
+                    except Exception:
+                        pass
+
+                    run_page_ocr = _should_run_page_ocr(
+                        cfg_module.enable_ocr,
+                        repair_mode,
+                        blk_list_ocr,
+                    )
+
+                    # 이미지 로딩 필요 여부 사전 검사 (OCR/Inpaint 미실행 시 불필요한 디스크 로딩 스킵)
+                    needs_img = run_page_ocr
+
+                    if cfg_module.enable_inpaint:
+                        try:
+                            if self.imgtrans_proj.load_mask_by_imgname(imgname_arg) is not None:
+                                needs_img = True
+                        except Exception:
+                            needs_img = True
+
+                    # 이미지 로드 (필요한 경우에만 read_img 실행)
+                    img_ocr = None
+                    if needs_img:
+                        for _attempt in range(2):
+                            try:
+                                img_ocr = self.imgtrans_proj.read_img(imgname_arg)
+                                break
+                            except (OSError, MemoryError) as e:
+                                if _attempt == 0:
+                                    import gc; gc.collect()
+                                    if LOGGER: LOGGER.warning(f"Image load retry for {imgname_arg} after gc: {e}")
+                                else:
+                                    if LOGGER: LOGGER.error(f"Image load failed permanently for {imgname_arg}: {e}")
+                        if img_ocr is None:
+                            if LOGGER: LOGGER.warning(f"⚠️ Skipping unreadable image: {imgname_arg}")
+                            skipped_files.append(imgname_arg)
+                            return
                     
-                    if cfg_module.enable_ocr:
+                    if run_page_ocr:
                         if debug_prof:
                             _phase_enter('ocr')
                             _ocr_t0 = time.perf_counter()
@@ -2286,10 +2431,10 @@ def _apply_chunked_processing_patch():
                                 prof_save_wait = time.perf_counter() - _sw_t0
                                 _phase_exit('save_wait')
                             self.ocr_counter += 1
+                            self.imgtrans_proj.update_page_progress(imgname_arg, RunStatus.FIN_OCR)
                             current_time = time.time()
                             if self.ocr_counter == 1 or current_time - last_save_time >= save_interval:
                                 self.update_ocr_progress.emit(self.ocr_counter)
-                                self.imgtrans_proj.update_page_progress(imgname_arg, RunStatus.FIN_OCR)
                                 last_save_time = current_time
 
                     # Check for valid text for logging (optional)
@@ -2358,30 +2503,21 @@ def _apply_chunked_processing_patch():
                         if LOGGER: LOGGER.info(f"Pipeline Safety: Forced translation signal for {imgname_arg}")
 
                     if cfg_module.enable_inpaint and not inpaint_signaled:
+                        layout_lock = getattr(self.translate_thread, '_v4_layout_state_lock', None)
+                        if layout_lock is not None:
+                            with layout_lock:
+                                self.translate_thread._v4_inpaint_failed_pages.add(imgname_arg)
+                        else:
+                            self.translate_thread._v4_inpaint_failed_pages = set(
+                                getattr(self.translate_thread, '_v4_inpaint_failed_pages', set())
+                            )
+                            self.translate_thread._v4_inpaint_failed_pages.add(imgname_arg)
                         with inpaint_counter_lock:
                             self.inpaint_counter += 1
                         self.update_inpaint_progress.emit(self.inpaint_counter)
                         self.imgtrans_proj.update_page_progress(imgname_arg, RunStatus.FIN_INPAINT)
                         if LOGGER: LOGGER.info(f"Pipeline Safety: Forced inpaint signal for {imgname_arg}")
                     
-                    # [메모리 강화] 주기적 GC 및 GPU 캐시 정리: 50페이지마다 실행
-                    try:
-                        if self.ocr_counter % 50 == 0:
-                            import gc; gc.collect()
-                            import torch
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                                torch.cuda.ipc_collect()
-                            elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                                torch.xpu.empty_cache()
-                            elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
-                                torch.mps.empty_cache()
-                            gc.collect()  # 2차 GC
-                            if LOGGER:
-                                LOGGER.info(f"🧹 주기적 GC 및 GPU 캐시 정리 완료 (OCR {self.ocr_counter}페이지)")
-                    except Exception:
-                        pass
-
             # Main Detection Loop
             processed_count = 0
             for imgname in pages_to_iterate:
@@ -2449,18 +2585,6 @@ def _apply_chunked_processing_patch():
                 # 2. Schedule OCR (Async)
                 processed_count += 1
 
-                # [메모리 강화] Detection 루프 주기적 GPU 캐시 정리
-                if processed_count % 50 == 0:
-                    try:
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        elif hasattr(torch, 'xpu') and torch.xpu.is_available():
-                            torch.xpu.empty_cache()
-                        elif hasattr(torch, 'mps') and hasattr(torch.mps, 'empty_cache'):
-                            torch.mps.empty_cache()
-                    except Exception:
-                        pass
-                
                 # Wait for initial buffer before starting OCR (only once)
                 if not ocr_started:
                     ocr_task_buffer.append(imgname)
@@ -2569,6 +2693,13 @@ def _apply_chunked_processing_patch():
                     if translate_done and inpaint_done:
                         break
                     if self.stop_requested:
+                        try:
+                            if hasattr(self, 'translate_thread') and self.translate_thread is not None:
+                                self.translate_thread.stop_requested = True
+                            import modules.translators.trans_llm_api_v4 as t_v4
+                            t_v4._V4_STOP_REQUESTED = True
+                        except Exception:
+                            pass
                         break
                     
                     # Update active flag to prevent stale state if possible

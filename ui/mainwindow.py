@@ -406,10 +406,12 @@ class MainWindow(mainwindow_cls):
         self.canvas.search_widget.case_sensitive_toggle.setChecked(pcfg.fsearch_case)
         self.canvas.search_widget.regex_toggle.setChecked(pcfg.fsearch_regex)
         self.canvas.search_widget.range_combobox.setCurrentIndex(pcfg.fsearch_range)
+        self.canvas.search_widget.set_search_state(pcfg.fsearch_text, pcfg.fsearch_history)
         self.global_search_widget.whole_word_toggle.setChecked(pcfg.gsearch_whole_word)
         self.global_search_widget.case_sensitive_toggle.setChecked(pcfg.gsearch_case)
         self.global_search_widget.regex_toggle.setChecked(pcfg.gsearch_regex)
         self.global_search_widget.range_combobox.setCurrentIndex(pcfg.gsearch_range)
+        self.global_search_widget.set_search_state(pcfg.gsearch_text, pcfg.gsearch_history)
 
         if self.rightComicTransStackPanel.isHidden():
             self.setPaintMode()
@@ -561,6 +563,9 @@ class MainWindow(mainwindow_cls):
         save_config()
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        # Persist final queries even when the user searched without pressing Enter.
+        self.canvas.search_widget.remember_current_search()
+        self.global_search_widget.remember_current_search()
         if not self.imgtrans_proj.is_empty:
             self.conditional_save(keep_exist_as_backup=True)
         while True:

@@ -207,12 +207,14 @@ class TranslateThread(ModuleThread):
             self.start()
 
     def _translate_page(self, page_dict, page_key: str, emit_finished=True):
+        if getattr(self, 'stop_requested', False):
+            return
         page = page_dict[page_key]
         try:
             self.translator.translate_textblk_lst(page)
         except Exception as e:
             create_error_dialog(e, self.tr('Translation Failed.'), 'TranslationFailed')
-        if emit_finished:
+        if emit_finished and not getattr(self, 'stop_requested', False):
             self.finish_translate_page.emit(page_key)
 
     def translatePage(self, page_dict, page_key: str):
@@ -401,6 +403,9 @@ class ImgtransThread(QThread):
                 valid_pages.append(p)
             except Exception as e:
                 LOGGER.warning(f"Pre-flight check: Skipping corrupted image '{p}' ({e})")
+                self.imgtrans_proj._image_info.setdefault(p, {})['corrupted'] = True
+                if hasattr(self.imgtrans_proj, 'update_page_progress') and RunStatus is not None:
+                    self.imgtrans_proj.update_page_progress(p, RunStatus.FIN_INPAINT)
         
         pages_to_iterate = valid_pages
         
@@ -418,6 +423,18 @@ class ImgtransThread(QThread):
         self.ocr_thread.num_process_pages = self.num_pages
         self.inpaint_thread.num_process_pages = self.num_pages
         self.translate_thread.num_process_pages = self.num_pages
+
+        # Project progress survives restarts. Reset only stages selected for this
+        # run so an incremental renderer cannot consume stale completion flags.
+        current_run_mask = RunStatus.FIN_TRANSLATE
+        if cfg_module.enable_ocr:
+            current_run_mask |= RunStatus.FIN_OCR
+        if cfg_module.enable_inpaint:
+            current_run_mask |= RunStatus.FIN_INPAINT
+        for page_name in pages_to_iterate:
+            page_info = self.imgtrans_proj._image_info.setdefault(page_name, {})
+            page_info['finish_code'] = page_info.get('finish_code', 0) & ~current_run_mask
+        self.translate_thread._v4_inpaint_failed_pages = set()
 
         low_vram_trans = False
         if self.translator is not None:
@@ -534,6 +551,12 @@ class ImgtransThread(QThread):
                         inpainted = self.inpainter.inpaint(img, mask, blk_list)
                         self.imgtrans_proj.save_inpainted(imgname, inpainted)
                     except Exception as e:
+                        layout_lock = getattr(self.translate_thread, '_v4_layout_state_lock', None)
+                        if layout_lock is not None:
+                            with layout_lock:
+                                self.translate_thread._v4_inpaint_failed_pages.add(imgname)
+                        else:
+                            self.translate_thread._v4_inpaint_failed_pages.add(imgname)
                         create_error_dialog(e, self.tr('Inpainting Failed.'), 'InpaintFailed')
                     
                 self.inpaint_counter += 1

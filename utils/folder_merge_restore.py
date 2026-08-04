@@ -55,10 +55,16 @@ def flatten_directories(root_path: Path, callback=None, progress_callback=None):
             for file_path in subdir_path.iterdir():
                 if file_path.is_file():
                     new_name = f"{LABEL_START}{dir_name}{LABEL_END}{file_path.name}"
-                    if len(new_name.encode('utf-8')) > 255:
-                        log(f"[{dir_name}] [경고] 파일명이 너무 길어 건너뜁니다: {file_path.name}")
-                        continue
                     destination_path = root_path / new_name
+                    # Windows NTFS: 파일명 최대 255자 (글자 수 기준)
+                    if len(new_name) > 255:
+                        log(f"[{dir_name}] [경고] 파일명이 255자를 초과하여 건너뜁니다: {file_path.name}")
+                        continue
+                    # Windows 전체 경로 길이 제한 (MAX_PATH = 260)
+                    full_path_len = len(str(destination_path))
+                    if full_path_len >= 260:
+                        log(f"[{dir_name}] [경고] 전체 경로가 {full_path_len}자로 260자를 초과하여 건너뜁니다: {file_path.name}")
+                        continue
                     files_to_move.append((file_path, destination_path))
 
             for source_path, dest_path in files_to_move:

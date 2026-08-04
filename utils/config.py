@@ -139,10 +139,14 @@ class ProgramConfig(Config):
     fsearch_whole_word: bool = False
     fsearch_regex: bool = False
     fsearch_range: int = 0
+    fsearch_text: str = ''
+    fsearch_history: List = field(default_factory=lambda: list())
     gsearch_case: bool = False
     gsearch_whole_word: bool = False
     gsearch_regex: bool = False
     gsearch_range: int = 0
+    gsearch_text: str = ''
+    gsearch_history: List = field(default_factory=lambda: list())
     darkmode: bool = False
     textselect_mini_menu: bool = True
     fold_textarea: bool = False

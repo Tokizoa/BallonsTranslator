@@ -1,10 +1,14 @@
 # modified from https://github.com/kha-white/manga-ocr/blob/master/manga_ocr/ocr.py
 import re
+import concurrent.futures
+import queue
+import threading
+import time
 import jaconv
 from transformers import AutoImageProcessor, AutoTokenizer, VisionEncoderDecoderModel
 import numpy as np
 import torch
-from typing import List
+from typing import Callable, List
 
 from .base import OCRBase, register_OCR, DEFAULT_DEVICE, DEVICE_SELECTOR, TextBlock
 
@@ -19,17 +23,150 @@ class MangaOcr:
     def to(self, device):
         self.model.to(device)
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(self, img: np.ndarray):
-        x = self.image_processor(img, return_tensors="pt").pixel_values.squeeze()
-        x = self.model.generate(x[None].to(self.model.device))[0].cpu()
-        x = self.tokenizer.decode(x, skip_special_tokens=True)
-        x = post_process(x)
-        return x
+        return self.ocr_batch([img])[0]
 
-    # todo
-    def ocr_batch(self, im_batch: torch.Tensor):
-        raise NotImplementedError
+    @torch.inference_mode()
+    def ocr_batch(self, images: List[np.ndarray]) -> List[str]:
+        """Run true batched OCR for a list of RGB images."""
+        if not images:
+            return []
+
+        pixel_values = self.image_processor(
+            images,
+            return_tensors="pt",
+        ).pixel_values.to(self.model.device)
+        output_ids = self.model.generate(pixel_values).cpu()
+        decoded = self.tokenizer.batch_decode(output_ids, skip_special_tokens=True)
+        return [post_process(text) for text in decoded]
+
+
+_BATCH_STOP = object()
+
+
+class MangaOCRBatchScheduler:
+    """Persistent cross-page batch queue backed by one or more MangaOCR models."""
+
+    def __init__(
+        self,
+        model_factory: Callable[[], "MangaOCR"],
+        worker_count: int,
+        batch_size: int,
+        batch_wait_ms: int = 10,
+        logger=None,
+        debug: bool = False,
+    ) -> None:
+        self.worker_count = max(1, int(worker_count))
+        self.batch_size = max(1, int(batch_size))
+        self.batch_wait_ms = max(0, int(batch_wait_ms))
+        self.logger = logger
+        self.debug = bool(debug)
+        self._queue = queue.Queue()
+        self._closed = False
+        self._models = []
+        self._threads = []
+
+        # Load models before starting workers so callers never observe a partial pool.
+        for _ in range(self.worker_count):
+            model = model_factory()
+            if not model.all_model_loaded():
+                model.load_model()
+            self._models.append(model)
+
+        for worker_index, model in enumerate(self._models):
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_index, model),
+                name=f"MangaOCRBatch-{worker_index + 1}",
+                daemon=True,
+            )
+            thread.start()
+            self._threads.append(thread)
+
+    def is_compatible(self, worker_count: int, batch_size: int) -> bool:
+        return (
+            not self._closed
+            and self.worker_count == max(1, int(worker_count))
+            and self.batch_size == max(1, int(batch_size))
+        )
+
+    def submit(self, image: np.ndarray) -> concurrent.futures.Future:
+        if self._closed:
+            raise RuntimeError("MangaOCR batch scheduler is closed")
+        future = concurrent.futures.Future()
+        self._queue.put((image, future))
+        return future
+
+    def _worker_loop(self, worker_index: int, model: "MangaOCR") -> None:
+        while True:
+            first = self._queue.get()
+            if first is _BATCH_STOP:
+                self._queue.task_done()
+                return
+
+            tasks = [first]
+            stop_after_batch = False
+            if self.batch_size > 1:
+                deadline = time.perf_counter() + self.batch_wait_ms / 1000.0
+                while len(tasks) < self.batch_size:
+                    timeout = deadline - time.perf_counter()
+                    if timeout <= 0:
+                        break
+                    try:
+                        item = self._queue.get(timeout=timeout)
+                    except queue.Empty:
+                        break
+                    if item is _BATCH_STOP:
+                        self._queue.task_done()
+                        stop_after_batch = True
+                        break
+                    tasks.append(item)
+
+            try:
+                images = [image for image, _future in tasks]
+                started_at = time.perf_counter()
+                results = model.ocr_batch(images)
+                elapsed = time.perf_counter() - started_at
+                if len(results) != len(tasks):
+                    raise RuntimeError(
+                        f"MangaOCR batch returned {len(results)} results for {len(tasks)} images"
+                    )
+                for (_image, future), text in zip(tasks, results):
+                    if not future.cancelled():
+                        future.set_result(text or "")
+                if self.debug and self.logger:
+                    self.logger.info(
+                        f"[MangaOCR batch] worker={worker_index + 1} "
+                        f"size={len(tasks)} infer={elapsed:.3f}s"
+                    )
+            except Exception as exc:
+                if self.logger:
+                    self.logger.error(
+                        f"MangaOCR batch worker {worker_index + 1} failed "
+                        f"for {len(tasks)} image(s): {exc}"
+                    )
+                for _image, future in tasks:
+                    if not future.cancelled():
+                        future.set_exception(exc)
+            finally:
+                for _task in tasks:
+                    self._queue.task_done()
+
+            if stop_after_batch:
+                return
+
+    def shutdown(self, wait: bool = True) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for _ in self._threads:
+            self._queue.put(_BATCH_STOP)
+        if wait:
+            for thread in self._threads:
+                thread.join()
+        self._threads.clear()
+        self._models.clear()
 
 
 def post_process(text):
@@ -68,6 +205,9 @@ class MangaOCR(OCRBase):
 
     def ocr_img(self, img: np.ndarray) -> str:
         return self.model(img)
+
+    def ocr_batch(self, images: List[np.ndarray]) -> List[str]:
+        return self.model.ocr_batch(images)
 
     def _ocr_blk_list(self, img: np.ndarray, blk_list: List[TextBlock], *args, **kwargs):
         im_h, im_w = img.shape[:2]
