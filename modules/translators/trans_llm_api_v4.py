@@ -12,6 +12,7 @@ import sys
 import csv
 import io
 import base64
+from collections import deque
 import httpx
 import openai
 
@@ -24,6 +25,7 @@ _V4_REPAIR_PAGES = None      # Set[str] of page keys to process during repair, N
 _V4_REPAIR_OCR_PAGES = None  # Set[str] of page keys where OCR is also needed (both src+trans empty)
 _V4_REPAIR_TOTAL_COUNT = 0   # Total target blocks for repair
 _V4_REPAIR_COMPLETED_COUNT = 0 # Completed blocks count during repair
+_V4_REPAIR_PROGRESS_LOCK = threading.Lock()
 _V4_AUTOLAYOUT_DETAIL_LOGGING = False  # Per-block AutoLayout diagnostics (default off)
 _V4_HEADLESS_LAYOUT_CALL = False  # True only around the queued main-thread layout call
 
@@ -33,6 +35,8 @@ _V4_SAVE_HEARTBEAT = 0.0
 _V4_SAVE_HEARTBEAT_INFO = ""  # short description of the last heartbeat event
 _V4_WATCHDOG_STOP = None  # threading.Event, created per-run
 _V4_STOP_REQUESTED = False  # Global stop flag for immediate cancellation during render/save
+_V4_PROJECT_SAVE_INIT_LOCK = threading.Lock()
+_V4_LAYOUT_RUN_INIT_LOCK = threading.Lock()
 from pydantic import BaseModel, Field, ValidationError, RootModel, AliasChoices
 from qtpy.QtCore import QObject, Signal, Qt, QRectF
 from qtpy.QtGui import QImage, QPainter, QFont, QColor, QPen
@@ -45,6 +49,32 @@ def _autolayout_detail_log(level: str, message: str) -> None:
         return
     log_func = getattr(LOGGER, level, LOGGER.debug)
     log_func(message)
+
+
+def _begin_v4_layout_run(translate_thread, reset_page_states=False) -> bool:
+    """Claim the single layout/save run slot for this translation thread."""
+    with _V4_LAYOUT_RUN_INIT_LOCK:
+        if not hasattr(translate_thread, '_v4_layout_run_lock'):
+            translate_thread._v4_layout_run_lock = threading.Lock()
+    if not translate_thread._v4_layout_run_lock.acquire(blocking=False):
+        return False
+
+    translate_thread._v4_save_completed = False
+    if reset_page_states:
+        state_lock = getattr(translate_thread, '_v4_layout_state_lock', None)
+        if state_lock is None:
+            state_lock = threading.Lock()
+            translate_thread._v4_layout_state_lock = state_lock
+        with state_lock:
+            translate_thread._v4_layout_states = {}
+        translate_thread._v4_layout_failed_pages = set()
+    return True
+
+
+def _end_v4_layout_run(translate_thread) -> None:
+    run_lock = getattr(translate_thread, '_v4_layout_run_lock', None)
+    if run_lock is not None and run_lock.locked():
+        run_lock.release()
 
 # -------------------------------------------------------------------------
 # Utility Imports (Safe at module level)
@@ -61,6 +91,201 @@ except ImportError:
     pcfg = None
     shared = None
     class MissingTranslatorParams(Exception): pass
+
+
+class _PerKeyRPMGate:
+    """Thread-safe rolling-window request reservation shared by all V4 workers."""
+
+    def __init__(self, clock=None, wait_hook=None):
+        self._clock = clock or time.monotonic
+        self._wait_hook = wait_hook
+        self._condition = threading.Condition()
+        self._request_times = {}
+        self._next_index = 0
+
+    def clear(self):
+        with self._condition:
+            self._request_times.clear()
+            self._next_index = 0
+            self._condition.notify_all()
+
+    def reserve(self, keys, rpm, stop_checker=None, on_wait=None):
+        keys = [key for key in keys if key]
+        if not keys:
+            raise ValueError("No API keys available for RPM reservation.")
+
+        rpm = int(rpm)
+        waited_total = 0.0
+        while True:
+            if stop_checker is not None and stop_checker():
+                raise InterruptedError("Translation stopped while waiting for an RPM slot.")
+
+            with self._condition:
+                now = self._clock()
+                if rpm <= 0:
+                    index = self._next_index % len(keys)
+                    self._next_index = (index + 1) % len(keys)
+                    return keys[index], waited_total
+
+                earliest_ready = None
+                for offset in range(len(keys)):
+                    index = (self._next_index + offset) % len(keys)
+                    key = keys[index]
+                    history = self._request_times.setdefault(key, deque())
+                    while history and now - history[0] >= 60.0:
+                        history.popleft()
+                    if len(history) < rpm:
+                        history.append(now)
+                        self._next_index = (index + 1) % len(keys)
+                        return key, waited_total
+                    key_ready = history[0] + 60.0
+                    earliest_ready = key_ready if earliest_ready is None else min(earliest_ready, key_ready)
+
+                wait_seconds = max(0.001, earliest_ready - now)
+                waited_total += wait_seconds
+                if on_wait is not None:
+                    on_wait(wait_seconds)
+
+                if self._wait_hook is None:
+                    self._condition.wait(timeout=wait_seconds)
+                else:
+                    # Test hook advances a fake clock without holding the gate lock.
+                    self._condition.release()
+                    try:
+                        self._wait_hook(wait_seconds)
+                    finally:
+                        self._condition.acquire()
+
+
+def _v4_save_project_checkpoint(project, args, kwargs, force_v4=False):
+    """Write one atomic project checkpoint without blocking Qt layout for the full I/O."""
+    global _HEADLESS_SAVE_IN_PROGRESS, _PIPELINE_ACTIVE, _DEBUG_PROFILING
+
+    if _HEADLESS_SAVE_IN_PROGRESS and not _PIPELINE_ACTIVE and not force_v4:
+        return
+
+    with _V4_PROJECT_SAVE_INIT_LOCK:
+        if not hasattr(project, '_v4_save_lock'):
+            project._v4_save_lock = threading.RLock()
+        if not hasattr(project, '_v4_full_save_lock'):
+            project._v4_full_save_lock = threading.Lock()
+        if not hasattr(project, '_v4_save_gate_lock'):
+            project._v4_save_gate_lock = threading.Lock()
+        if not hasattr(project, '_v4_full_save_active'):
+            project._v4_full_save_active = False
+        if not hasattr(project, '_v4_last_full_save_monotonic'):
+            project._v4_last_full_save_monotonic = 0.0
+
+    ordinary_pipeline_save = _PIPELINE_ACTIVE and not force_v4
+    if ordinary_pipeline_save:
+        try:
+            save_interval = max(0.0, float(getattr(project, '_v4_save_interval', 15.0)))
+        except (TypeError, ValueError):
+            save_interval = 15.0
+        now = time.monotonic()
+        with project._v4_save_gate_lock:
+            elapsed = now - project._v4_last_full_save_monotonic
+            if project._v4_full_save_active or elapsed < save_interval:
+                if _DEBUG_PROFILING and LOGGER:
+                    reason = 'active' if project._v4_full_save_active else f'{elapsed:.2f}s/{save_interval:.2f}s'
+                    LOGGER.debug(f'[PROF-SAVE] checkpoint skipped ({reason})')
+                return
+            project._v4_full_save_active = True
+
+    success = False
+    tmp_save_tgt = project.proj_path + '.tmp'
+    lock_started = time.perf_counter()
+    try:
+        with project._v4_full_save_lock:
+            lock_wait = time.perf_counter() - lock_started
+            from utils.proj_imgtrans import TextBlkEncoder
+            from utils.exceptions import ProjectDirNotExistException
+
+            if not os.path.exists(project.directory):
+                raise ProjectDirNotExistException
+
+            journal_cutoff = (
+                project.progress_journal_cutoff()
+                if hasattr(project, 'progress_journal_cutoff') else 0
+            )
+            io_started = time.perf_counter()
+            try:
+                # Snapshot only the small header and one page at a time. Qt
+                # rendering can acquire _v4_save_lock between pages instead of
+                # waiting for a 1,000-page JSON write to finish.
+                with project._v4_save_lock:
+                    directory_json = json.dumps(project.directory, ensure_ascii=False)
+                    current_img_json = json.dumps(project.current_img, ensure_ascii=False)
+                    image_info_json = json.dumps(
+                        project._image_info, ensure_ascii=False, cls=TextBlkEncoder
+                    )
+                    page_keys = list(dict.fromkeys(
+                        list(project.pages) + list(project.not_found_pages)
+                    ))
+
+                with open(tmp_save_tgt, 'w', encoding='utf-8') as stream:
+                    stream.write('{')
+                    stream.write('"directory": ' + directory_json + ', ')
+                    stream.write('"current_img": ' + current_img_json + ', ')
+                    stream.write('"image_info": ' + image_info_json + ', ')
+                    stream.write('"pages": {')
+                    for index, page_key in enumerate(page_keys):
+                        with project._v4_save_lock:
+                            if page_key in project.not_found_pages:
+                                blocks = project.not_found_pages[page_key]
+                            else:
+                                blocks = project.pages.get(page_key, [])
+                            page_json = json.dumps(
+                                blocks, ensure_ascii=False, cls=TextBlkEncoder
+                            )
+                        if index:
+                            stream.write(', ')
+                        stream.write(json.dumps(page_key, ensure_ascii=False) + ': ')
+                        stream.write(page_json)
+                        time.sleep(0)
+                    stream.write('}}')
+            except MemoryError:
+                if LOGGER:
+                    LOGGER.error(
+                        f'MemoryError while saving project to {project.proj_path}. '
+                        'Existing save file preserved.'
+                    )
+                return
+            except Exception as exc:
+                if LOGGER:
+                    LOGGER.error(f'Failed to save project to {project.proj_path}: {exc}')
+                return
+
+            keep_exist_as_backup = kwargs.get('keep_exist_as_backup', False)
+            if args:
+                keep_exist_as_backup = args[0]
+            if os.path.exists(project.proj_path) and keep_exist_as_backup:
+                os.replace(project.proj_path, project.proj_path + '.backup')
+            os.replace(tmp_save_tgt, project.proj_path)
+            success = True
+
+            if hasattr(project, 'compact_progress_journal'):
+                project.compact_progress_journal(journal_cutoff)
+            if LOGGER and not _REPLACE_RERENDER_ACTIVE:
+                LOGGER.debug(f'project saved to {project.proj_path}')
+            if _DEBUG_PROFILING and LOGGER:
+                io_duration = time.perf_counter() - io_started
+                if io_duration > 0.1 or lock_wait > 0.1:
+                    LOGGER.info(
+                        f'[PROF-SAVE] full_lock_wait={lock_wait:.3f}s '
+                        f'io={io_duration:.3f}s'
+                    )
+    finally:
+        if os.path.exists(tmp_save_tgt):
+            try:
+                os.remove(tmp_save_tgt)
+            except OSError:
+                pass
+        if ordinary_pipeline_save:
+            with project._v4_save_gate_lock:
+                if success:
+                    project._v4_last_full_save_monotonic = time.monotonic()
+                project._v4_full_save_active = False
 
 # -------------------------------------------------------------------------
 # Monkey Patching Setup (Delayed)
@@ -175,117 +400,10 @@ def _install_patches():
                     ProjImgTrans._original_save_v4_patch = ProjImgTrans.save
                     
                     def _patched_save_thread_safe(self, *args, **kwargs):
-                        global _HEADLESS_SAVE_IN_PROGRESS, _PIPELINE_ACTIVE, _LAST_SAVE_TIME, _DEBUG_PROFILING
-                        import time
-                        import gc
-
                         force_v4 = bool(kwargs.pop('_v4_force', False))
-
-                        # A standalone re-layout owns the project while it renders. During the
-                        # translation pipeline, however, periodic and final JSON saves are allowed
-                        # and serialized with the exact same project lock as layout mutations.
-                        if _HEADLESS_SAVE_IN_PROGRESS and not _PIPELINE_ACTIVE and not force_v4:
-                            return
-
-                        # Debounce ordinary pipeline autosaves. The final save bypasses this once.
-                        if _PIPELINE_ACTIVE and not force_v4:
-                            current_time = time.time()
-                            if current_time - _LAST_SAVE_TIME < 15.0:
-                                # Skip this save, too soon
-                                if _DEBUG_PROFILING and LOGGER:
-                                    LOGGER.debug(f"🔬 [PROF-SAVE] skipped (debounce {current_time - _LAST_SAVE_TIME:.2f}s)")
-                                return
-                            _LAST_SAVE_TIME = current_time
-
-                        # Lazily create a lock for this project instance
-                        if not hasattr(self, '_v4_save_lock'):
-                            self._v4_save_lock = threading.RLock()
-
-                        # [PROF] Lock wait + IO duration tracking
-                        _prof_lock_wait = 0.0
-                        _prof_io_dur = 0.0
-                        _prof_lock_t0 = time.perf_counter() if _DEBUG_PROFILING else 0.0
-
-                        with self._v4_save_lock:
-                            if _DEBUG_PROFILING:
-                                _prof_lock_wait = time.perf_counter() - _prof_lock_t0
-                                _prof_io_t0 = time.perf_counter()
-
-                            # Import here to avoid issues at definition time
-                            from utils.proj_imgtrans import TextBlkEncoder
-                            from utils.exceptions import ProjectDirNotExistException
-
-                            # Free memory before serialization
-                            gc.collect()
-
-                            if not os.path.exists(self.directory):
-                                raise ProjectDirNotExistException
-
-                            tmp_save_tgt = self.proj_path + '.tmp'
-                            try:
-                                # [메모리 강화] json.dump 딕셔너리 분할 직렬화 (메모리 단편화 원천 방지)
-                                with open(tmp_save_tgt, "w", encoding="utf-8") as f:
-                                    f.write('{')
-                                    f.write('"directory": ' + json.dumps(self.directory, ensure_ascii=False) + ', ')
-                                    f.write('"current_img": ' + json.dumps(self.current_img, ensure_ascii=False) + ', ')
-                                    f.write('"image_info": ' + json.dumps(self._image_info, ensure_ascii=False, cls=TextBlkEncoder) + ', ')
-                                    
-                                    f.write('"pages": {')
-                                    _all_pages = self.pages.copy()
-                                    _all_pages.update(self.not_found_pages)
-                                    
-                                    _first_page = True
-                                    for _p_key, _blk_list in _all_pages.items():
-                                        if not _first_page:
-                                            f.write(', ')
-                                        _first_page = False
-                                        f.write(json.dumps(_p_key, ensure_ascii=False) + ': ')
-                                        # Dump only a single page to the disk buffer explicitly
-                                        json.dump(_blk_list, f, ensure_ascii=False, cls=TextBlkEncoder)
-                                    
-                                    f.write('}}')
-                                
-                                gc.collect()
-                            except MemoryError:
-                                if LOGGER: LOGGER.error(f"MemoryError while saving project to {self.proj_path}. Project data may be too large. Existing save file preserved.")
-                                if os.path.exists(tmp_save_tgt):
-                                    try:
-                                        os.remove(tmp_save_tgt)
-                                    except OSError:
-                                        pass
-                                return  # Don't crash, preserve existing save file
-                            except Exception as e:
-                                if LOGGER: LOGGER.error(f"Failed to save project to {self.proj_path}: {e}")
-                                if os.path.exists(tmp_save_tgt):
-                                    try:
-                                        os.remove(tmp_save_tgt)
-                                    except OSError:
-                                        pass
-                                return
-
-                            # Atomic replace: tmp -> final
-                            keep_exist_as_backup = kwargs.get('keep_exist_as_backup', False)
-                            if len(args) > 0:
-                                keep_exist_as_backup = args[0]
-
-                            if os.path.exists(self.proj_path) and keep_exist_as_backup:
-                                os.replace(self.proj_path, self.proj_path + '.backup')
-                            os.replace(tmp_save_tgt, self.proj_path)
-                            if LOGGER and not _REPLACE_RERENDER_ACTIVE:
-                                LOGGER.debug(f'project saved to {self.proj_path}')
-
-                            if _DEBUG_PROFILING and LOGGER:
-                                _prof_io_dur = time.perf_counter() - _prof_io_t0
-                                # Noise reduction: only log if above threshold
-                                if _prof_io_dur > 0.1 or _prof_lock_wait > 0.1:
-                                    try:
-                                        _prof_size = os.path.getsize(self.proj_path)
-                                    except Exception:
-                                        _prof_size = -1
-                                    LOGGER.info(
-                                        f"🔬 [PROF-SAVE] lock_wait={_prof_lock_wait:.3f}s "
-                                        f"io={_prof_io_dur:.3f}s size={_prof_size}B"
-                                    )
+                        return _v4_save_project_checkpoint(
+                            self, args, kwargs, force_v4=force_v4
+                        )
                     
                     ProjImgTrans.save = _patched_save_thread_safe
                     if LOGGER: LOGGER.info("Monkey patch applied: ProjImgTrans.save (Thread-Safe + Debounce)")
@@ -1733,80 +1851,8 @@ _GLOBAL_SAVE_LOCK = threading.Lock()
 # Global flags for save suppression
 _HEADLESS_SAVE_IN_PROGRESS = False
 _PIPELINE_ACTIVE = False  # Set to True when OCR/Translation pipeline is running
-_LAST_SAVE_TIME = 0.0  # For debouncing
 _REPLACE_RERENDER_ACTIVE = False  # Suppress save debug logs during replace-rerender
 _DEBUG_PROFILING = False  # OCR 파이프라인 프로파일링 토글 (ocr_llm_api_v4가 pipeline 시작 시 세팅)
-
-# -------------------------------------------------------------------------
-# UI Monkey Patching: Add Saving Bar dynamically (Delayed)
-# -------------------------------------------------------------------------
-def _install_ui_patches():
-    from qtpy.QtWidgets import QApplication
-    from qtpy.QtCore import QThread
-    
-    app = QApplication.instance()
-    if app and QThread.currentThread() is not app.thread():
-        print("DEBUG: _install_ui_patches called from background thread. SKIPPING to avoid freeze.")
-        return
-
-    print("DEBUG: _install_ui_patches running...")
-    try:
-        from ui.custom_widget import ImgtransProgressMessageBox, TaskProgressBar
-        
-        # 1. Inject updateSavingProgress method
-        def updateSavingProgress(self, value: int, msg: str = ''):
-            if hasattr(self, 'saving_bar'):
-                self.saving_bar.updateProgress(value, msg)
-                
-        if not hasattr(ImgtransProgressMessageBox, 'updateSavingProgress'):
-            setattr(ImgtransProgressMessageBox, 'updateSavingProgress', updateSavingProgress)
-
-        # 2. Patch __init__ to add saving_bar widget
-        _original_init = ImgtransProgressMessageBox.__init__
-
-        def _patched_init(self, *args, **kwargs):
-            _original_init(self, *args, **kwargs)
-            # Add Saving Bar
-            self.saving_bar = TaskProgressBar(self.tr('Saving: '), True, self)
-            
-            # Insert into layout (index 4 is after Translate bar)
-            layout = self.layout()
-            layout.insertWidget(4, self.saving_bar)
-            
-        if not getattr(ImgtransProgressMessageBox, '_saving_bar_patched', False):
-            ImgtransProgressMessageBox.__init__ = _patched_init
-            setattr(ImgtransProgressMessageBox, '_saving_bar_patched', True)
-                
-        # 3. Patch zero_progress to reset saving bar too
-        _original_zero = ImgtransProgressMessageBox.zero_progress
-        
-        def _patched_zero(self):
-            _original_zero(self)
-            if hasattr(self, 'saving_bar'):
-                self.saving_bar.updateProgress(0)
-                
-        if not getattr(ImgtransProgressMessageBox, '_zero_patched', False):
-            ImgtransProgressMessageBox.zero_progress = _patched_zero
-            setattr(ImgtransProgressMessageBox, '_zero_patched', True)
-
-        # 4. Patch Existing Instances (Runtime Injection)
-        # Since the box might be created before we patch __init__, we need to fix existing ones.
-        from qtpy.QtWidgets import QApplication
-        app = QApplication.instance()
-        if app:
-            for widget in app.allWidgets():
-                # Check by class name to avoid import issues if class is different object
-                if widget.__class__.__name__ == 'ImgtransProgressMessageBox':
-                    print("DEBUG: Found ImgtransProgressMessageBox instance! Patching...")
-                    if not hasattr(widget, 'saving_bar'):
-                        widget.saving_bar = TaskProgressBar(widget.tr('Saving: '), True, widget)
-                        # Insert before buttons (usually index 4)
-                        widget.layout().insertWidget(4, widget.saving_bar)
-                        # Hide by default or show? Usually others are shown.
-                        widget.saving_bar.show()
-
-    except ImportError:
-        pass
 
 # -------------------------------------------------------------------------
 # Orchestration Patch
@@ -1820,14 +1866,21 @@ def _imgtrans_pipeline_v4_orchestrator(self):
     import time
     start_time = time.time()
 
+    # Enable cheap per-page recovery before OCR/inpaint/translation begin.
+    # Full JSON checkpoints use the translator's existing save interval.
+    is_v4 = getattr(self.translator, 'use_image_batching', False)
+    project = getattr(self, 'imgtrans_proj', None)
+    if is_v4 and project is not None:
+        if hasattr(project, 'enable_progress_journal'):
+            project.enable_progress_journal(True)
+        project._v4_save_interval = getattr(self.translator, 'save_interval', 3.0)
+
     # Run the actual pipeline (either original or OCR-patched version)
     if hasattr(self, '_original_imgtrans_pipeline_trans_v4'):
         self._original_imgtrans_pipeline_trans_v4()
     
     # After EVERYTHING is done (Detection, OCR, Translation, Inpainting)
     # Check if we are using the V4 Translator
-    is_v4 = getattr(self.translator, 'use_image_batching', False)
-    
     # Check if save was already handled by OCR pipeline (Robust Flag Check)
     if getattr(self.translate_thread, '_v4_save_completed', False):
         if LOGGER:
@@ -1886,7 +1939,8 @@ from qtpy.QtCore import QObject, Signal, Qt, QTimer, Slot
 
 class SaveSignaler(QObject):
     save_signal = Signal()
-    progress_signal = Signal(int, str)
+    layout_progress_signal = Signal(int, str)
+    save_progress_signal = Signal(int, str)
     finished_signal = Signal()
 
 
@@ -2066,10 +2120,19 @@ def _prepare_layout_page(proj, page_key: str, enable_autolayout: bool = True):
 
 
 class UIHelper(QObject):
-    def __init__(self, msgbox, proj=None, stm=None, total_pages=None, pipeline_start_time=None):
+    def __init__(
+        self,
+        msgbox,
+        proj=None,
+        stm=None,
+        total_pages=None,
+        pipeline_start_time=None,
+        translate_thread=None,
+    ):
         super().__init__()
         self.msgbox = msgbox
         self.proj = proj
+        self.translate_thread = translate_thread
         self.stm = stm # [NEW] SceneTextManager for layout/refresh
         self.rendered_images = {} # Thread-safe storage for cross-thread return values
         self.render_timings = {}
@@ -2080,14 +2143,34 @@ class UIHelper(QObject):
         self._layout_total_pages = total_pages if total_pages is not None else (len(proj.pages) if proj else 0)
         self._pipeline_start_time = pipeline_start_time  # Track overall pipeline start time
 
-    def update_ui(self, percent, text):
+    def process_events_and_check_stop(self):
+        """Keep the progress dialog clickable while a page renders on the GUI thread."""
+        global _V4_STOP_REQUESTED
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+        requested = _V4_STOP_REQUESTED or bool(
+            getattr(self.translate_thread, 'stop_requested', False)
+        )
+        if requested:
+            _V4_STOP_REQUESTED = True
+        return requested
+
+    def _show_v4_progress(self):
         if self.msgbox:
             if not self.msgbox.isVisible():
                 self.msgbox.show()
-            if hasattr(self.msgbox, 'updateSavingProgress'):
-                self.msgbox.updateSavingProgress(percent, text)
-            else:
-                self.msgbox.updateTranslateProgress(percent, text)
+            self.msgbox.setV4BarsVisible(True)
+
+    def update_layout_ui(self, percent, text):
+        if self.msgbox:
+            self._show_v4_progress()
+            self.msgbox.updateLayoutProgress(percent, text)
+
+    def update_save_ui(self, percent, text):
+        if self.msgbox:
+            self._show_v4_progress()
+            self.msgbox.updateSavingProgress(percent, text)
 
     def finish_ui(self):
         # Calculate elapsed time
@@ -2105,10 +2188,9 @@ class UIHelper(QObject):
 
         if self.msgbox:
             finish_msg = f" (저장 완료!{elapsed_str})"
-            if hasattr(self.msgbox, 'updateSavingProgress'):
-                self.msgbox.updateSavingProgress(100, finish_msg)
-            else:
-                self.msgbox.updateTranslateProgress(100, finish_msg)
+            self._show_v4_progress()
+            self.msgbox.updateLayoutProgress(100, " (레이아웃 완료!)")
+            self.msgbox.updateSavingProgress(100, finish_msg)
             QTimer.singleShot(1500, self.msgbox.accept)
 
             # [NEW] Refresh GUI to show latest translations (layout already done in render_page_task)
@@ -2148,11 +2230,14 @@ class UIHelper(QObject):
         Stores result in self.rendered_images[page_key]
         """
         render_started = time.perf_counter()
+        if self.process_events_and_check_stop():
+            self.rendered_images[page_key] = None
+            self.render_timings[page_key] = time.perf_counter() - render_started
+            return
         # --- AutoLayout Progress ---
         _total = self._layout_total_pages if self._layout_total_pages else (len(self.proj.pages) if self.proj else '?')
         _page_keys = list(self.proj.pages.keys()) if self.proj else []
         _page_idx = _page_keys.index(page_key) + 1 if page_key in _page_keys else '?'
-        self._layout_completed_count += 1
         from datetime import datetime as _dt
         _time_str = _dt.now().strftime('%H:%M:%S')
         _elapsed = time.time() - self._layout_start_time
@@ -2165,8 +2250,18 @@ class UIHelper(QObject):
         prepared_blocks = prepared_page.get('blocks', {}) if prepared_page else {}
 
         project_lock = getattr(self.proj, '_v4_save_lock', None) if self.proj else None
+        project_lock_acquired = False
         if project_lock is not None:
-            project_lock.acquire()
+            # Never block the GUI event loop indefinitely behind a project save.
+            # Polling lets the Stop click be delivered even while the lock is busy.
+            while not project_lock.acquire(timeout=0.05):
+                if self.process_events_and_check_stop():
+                    self.rendered_images[page_key] = None
+                    self.render_timings[page_key] = time.perf_counter() - render_started
+                    if LOGGER:
+                        LOGGER.info(f"AutoLayout cancelled while waiting for project lock: {page_key}")
+                    return
+            project_lock_acquired = True
 
         try:
             # Import GUI classes locally to avoid circular dependencies at module level
@@ -2224,7 +2319,11 @@ class UIHelper(QObject):
                     image_rgb = None  # Ensure cleanup
 
             global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO, _V4_HEADLESS_LAYOUT_CALL
+            render_cancelled = False
             for i, blk in enumerate(blk_list):
+                if self.process_events_and_check_stop():
+                    render_cancelled = True
+                    break
                 # [Diag] Per-block heartbeat + debug log. Last logged (page, blk) before a
                 # freeze is exactly the block where the main thread hung.
                 _V4_SAVE_HEARTBEAT = time.time()
@@ -2359,6 +2458,13 @@ class UIHelper(QObject):
                         print(f"V4 Render: Failed to add TextBlkItem {i} in {page_key}: {item_err}")
                         traceback.print_exc()
 
+            if render_cancelled or self.process_events_and_check_stop():
+                scene.clear()
+                self.rendered_images[page_key] = None
+                if LOGGER:
+                    LOGGER.info(f"AutoLayout cancelled during render: {page_key}")
+                return
+
             # Render
             painter = QPainter(image)
             painter.setRenderHint(QPainter.Antialiasing)
@@ -2391,6 +2497,7 @@ class UIHelper(QObject):
                 except Exception:
                     pass
 
+            self._layout_completed_count += 1
             self.rendered_images[page_key] = image
             
         except Exception as e:
@@ -2400,7 +2507,7 @@ class UIHelper(QObject):
             self.rendered_images[page_key] = None
         finally:
             self.render_timings[page_key] = time.perf_counter() - render_started
-            if project_lock is not None:
+            if project_lock is not None and project_lock_acquired:
                 project_lock.release()
 
 class TaskRunner(QObject):
@@ -2413,6 +2520,12 @@ class TaskRunner(QObject):
 
 class InvalidNumTranslations(Exception):
     pass
+
+
+class BatchTranslationError(Exception):
+    """A multi-page request failed validation after its normal batch retries."""
+    pass
+
 
 class ContentFilterError(Exception):
     """검열(Content Filter)로 인한 차단."""
@@ -2463,8 +2576,13 @@ class LLM_API_Translator_V4(BaseTranslator):
         },
         "concurrent images": {
             "value": 3,
-            "display_name": "동시 번역 이미지 수",
-            "description": "동시에 병렬로 번역할 이미지(페이지) 수입니다.",
+            "display_name": "동시 번역 배치 수",
+            "description": "동시에 병렬로 실행할 다중 페이지 번역 요청 수입니다.",
+        },
+        "translation batch pages": {
+            "value": 10,
+            "display_name": "번역 배치 페이지 수",
+            "description": "한 번의 API 요청에 합칠 최대 페이지 수입니다. 1이면 기존 페이지별 요청 방식입니다.",
         },
         "initial batch buffer": {
             "value": 5,
@@ -2656,12 +2774,99 @@ class LLM_API_Translator_V4(BaseTranslator):
         import sys
         if 'ui.module_manager' in sys.modules:
             _install_patches()
-            _install_ui_patches()
         else:
             # Fallback
             from qtpy.QtCore import QTimer
             QTimer.singleShot(0, _install_patches)
-            QTimer.singleShot(0, _install_ui_patches)
+
+    def _v4_eligible_translation_blocks(self, blk_list):
+        eligible = []
+        for blk in blk_list:
+            if _V4_REPAIR_MODE and not getattr(blk, '_v4_needs_repair', False):
+                continue
+            text = blk.get_text() if hasattr(blk, 'get_text') else getattr(blk, 'text', '')
+            if not isinstance(text, str):
+                text = str(text) if text is not None else ''
+            if text.strip() and 'error:' not in text.lower():
+                eligible.append(blk)
+        return eligible
+
+    def _v4_finalize_repair_blocks(self, blocks):
+        if not _V4_REPAIR_MODE or not blocks:
+            return
+        global _V4_REPAIR_COMPLETED_COUNT, _V4_REPAIR_TOTAL_COUNT
+        with _V4_REPAIR_PROGRESS_LOCK:
+            _V4_REPAIR_COMPLETED_COUNT += len(blocks)
+            completed = _V4_REPAIR_COMPLETED_COUNT
+            total = _V4_REPAIR_TOTAL_COUNT
+        if LOGGER:
+            LOGGER.info(f"[Repair 진행률] {completed} / {total} 블록 완료")
+        for blk in blocks:
+            for attr_name in ('_v4_needs_repair', '_v4_needs_ocr'):
+                try:
+                    delattr(blk, attr_name)
+                except AttributeError:
+                    pass
+
+    def translate_textblk_batch_atomic(self, blk_list, should_stop=None):
+        """Translate a flattened multi-page block list and commit only after validation."""
+        filtered_list = self._v4_eligible_translation_blocks(blk_list)
+        if not filtered_list:
+            return []
+
+        source_text = []
+        translations = []
+        for blk in filtered_list:
+            text = blk.get_text() if hasattr(blk, 'get_text') else getattr(blk, 'text', '')
+            text = text if isinstance(text, str) else str(text)
+            source_text.append(text)
+            translations.append(text)
+
+        for callback in self._preprocess_hooks.values():
+            callback(
+                translations=translations,
+                textblocks=filtered_list,
+                translator=self,
+                source_text=source_text,
+            )
+
+        if should_stop is not None and should_stop():
+            raise InterruptedError("Translation stopped before multi-page request.")
+
+        to_lang = self.lang_map.get(self.lang_target, self.lang_target)
+        prompt = self._make_prompt(
+            source_text,
+            self.lang_map.get(self.lang_source, self.lang_source),
+            to_lang,
+        )
+        translated = self._process_batch_sync(
+            prompt,
+            len(source_text),
+            to_lang=to_lang,
+            allow_individual_recovery=False,
+        )
+        if len(translated) != len(filtered_list):
+            raise InvalidNumTranslations(
+                f"Expected {len(filtered_list)}, got {len(translated)}"
+            )
+        if any(str(value).strip().upper().startswith('[ERROR:') for value in translated):
+            raise BatchTranslationError("Multi-page response contains failed translation markers.")
+
+        translations[:] = translated
+        for callback in self._postprocess_hooks.values():
+            callback(
+                translations=translations,
+                textblocks=filtered_list,
+                translator=self,
+            )
+
+        if should_stop is not None and should_stop():
+            raise InterruptedError("Translation stopped before multi-page result commit.")
+
+        for translated_text, blk in zip(translations, filtered_list):
+            blk.translation = translated_text
+        self._v4_finalize_repair_blocks(filtered_list)
+        return filtered_list
 
     def translate_textblk_lst(self, blk_list: List, *args, **kwargs):
         """Standard entry point for translation"""
@@ -2699,22 +2904,9 @@ class LLM_API_Translator_V4(BaseTranslator):
         # Call parent or base translation logic with filtered list
         res = super().translate_textblk_lst(filtered_list, *args, **kwargs)
 
-        # [Repair Mode] Clean up repair flags after translation & log progress
-        if _V4_REPAIR_MODE:
-            global _V4_REPAIR_COMPLETED_COUNT, _V4_REPAIR_TOTAL_COUNT
-            _V4_REPAIR_COMPLETED_COUNT += len(filtered_list)
-            if LOGGER:
-                LOGGER.info(f"[Repair 진행률] {_V4_REPAIR_COMPLETED_COUNT} / {_V4_REPAIR_TOTAL_COUNT} 블록 완료")
-
-            for blk in filtered_list:
-                try:
-                    del blk._v4_needs_repair
-                except AttributeError:
-                    pass
-                try:
-                    del blk._v4_needs_ocr
-                except AttributeError:
-                    pass
+        # [Repair Mode] Clean up repair flags with the same synchronized counter
+        # used by multi-page batches.
+        self._v4_finalize_repair_blocks(filtered_list)
         
         # --- FINAL SAFETY TRIGGER ---
         # If we are NOT using the parallel patch (or even if we are), 
@@ -2770,6 +2962,11 @@ class LLM_API_Translator_V4(BaseTranslator):
         self.request_count_minute = 0
         self.minute_start_time = time.time()
         self.key_usage = {}
+        self._rpm_gate = _PerKeyRPMGate()
+        self._request_metrics_lock = threading.Lock()
+        self._v4_api_request_count = 0
+        self._v4_rpm_wait_seconds = 0.0
+        self._v4_batch_split_count = 0
         self.client = None
 
     # -------------------------------------------------------------------------
@@ -3011,6 +3208,8 @@ class LLM_API_Translator_V4(BaseTranslator):
 
             # Fallback to general error handling below
             pass
+        except InterruptedError:
+            raise
         except Exception:
             pass
 
@@ -3087,7 +3286,7 @@ class LLM_API_Translator_V4(BaseTranslator):
         except Exception:
             return [f"[ERROR: Translation Failed]" for _ in range(num_src)]
 
-    def _process_batch_sync(self, prompt, num_src, to_lang: str = None):
+    def _process_batch_sync(self, prompt, num_src, to_lang: str = None, allow_individual_recovery=True):
         """Synchronous version for thread-safe parallel processing"""
         RETRYABLE_EXCEPTIONS = (
             openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError,
@@ -3125,6 +3324,8 @@ class LLM_API_Translator_V4(BaseTranslator):
             
             while True:
                 try:
+                    if _PIPELINE_ACTIVE and _V4_STOP_REQUESTED:
+                        raise InterruptedError("Translation stopped before API request.")
                     parsed_response = self._request_translation_sync(prompt, model_name=current_model)
                     if not parsed_response or not parsed_response.root:
                         raise ValueError("Received empty or invalid parsed response from API.")
@@ -3137,6 +3338,15 @@ class LLM_API_Translator_V4(BaseTranslator):
                     
                     if len(parsed_response.root) != num_src:
                         raise InvalidNumTranslations(f"Expected {num_src}, got {len(parsed_response.root)}")
+
+                    response_ids = [item.id for item in parsed_response.root]
+                    expected_ids = set(range(1, num_src + 1))
+                    if len(response_ids) != len(set(response_ids)):
+                        raise InvalidNumTranslations("API response contains duplicate IDs")
+                    if set(response_ids) != expected_ids:
+                        raise InvalidNumTranslations(
+                            f"Expected IDs 1..{num_src}, got {sorted(set(response_ids))}"
+                        )
 
                     for item in parsed_response.root:
                         original_text = _src_map.get(item.id, "")
@@ -3194,6 +3404,9 @@ class LLM_API_Translator_V4(BaseTranslator):
                     # 검열 에러는 같은 형식으로 재시도해도 무의미하므로 즉시 전파
                     raise
 
+                except InterruptedError:
+                    raise
+
                 except Exception as e:
                     api_retry_attempt += 1
                     if self.logger:
@@ -3230,6 +3443,8 @@ class LLM_API_Translator_V4(BaseTranslator):
                 mismatch_retry_attempt = 0
 
                 return attempt_request()
+            except InterruptedError:
+                raise
             except ContentFilterError as cfe2:
                 if self.logger:
                     self.logger.error(f"❌ 형식 전환({switched_format}) 후에도 검열 차단됨: {cfe2}")
@@ -3248,6 +3463,8 @@ class LLM_API_Translator_V4(BaseTranslator):
 
             # Fallback to general error handling below
             pass
+        except InterruptedError:
+            raise
         except Exception:
             pass
 
@@ -3261,9 +3478,16 @@ class LLM_API_Translator_V4(BaseTranslator):
             
             try:
                 return attempt_request(current_model=fallback)
+            except InterruptedError:
+                raise
             except Exception as fallback_e:
                 if self.logger:
                     self.logger.warning(f"Fallback batch also failed: {fallback_e}")
+
+        if not allow_individual_recovery:
+            raise BatchTranslationError(
+                f"Batch translation failed after normal retries ({num_src} text blocks)."
+            )
         
         # Last resort: individual retry with primary model
         try:
@@ -3397,6 +3621,14 @@ class LLM_API_Translator_V4(BaseTranslator):
     def concurrent_images(self) -> int:
         val = self.get_param_value("concurrent images")
         return int(val) if val != "" else 3
+
+    @property
+    def translation_batch_pages(self) -> int:
+        val = self.get_param_value("translation batch pages")
+        try:
+            return max(1, int(val))
+        except (TypeError, ValueError):
+            return 10
     
     @property
     def initial_batch_buffer(self) -> int:
@@ -3609,25 +3841,19 @@ class LLM_API_Translator_V4(BaseTranslator):
             return content_parts[-1].get("text", "")
         return ""
 
-    def _respect_key_limit(self, key: str) -> bool:
-        rpm = self.max_rpm
-        if rpm <= 0:
-            return True
-        now = time.time()
-        count, start_time = self.key_usage.get(key, (0, now))
-        if now - start_time >= 60:
-            count, start_time = 0, now
-            self.key_usage[key] = (count, start_time)
-        if count >= rpm:
-            wait_time = 60.1 - (now - start_time)
-            if wait_time > 0:
-                self.logger.warning(
-                    f"RPM limit ({rpm}) reached for key {key[:6]}... Waiting {wait_time:.2f} seconds."
-                )
-                time.sleep(wait_time)
-            self.key_usage[key] = (0, time.time())
-            return False
-        return True
+    def reset_request_metrics(self):
+        with self._request_metrics_lock:
+            self._v4_api_request_count = 0
+            self._v4_rpm_wait_seconds = 0.0
+            self._v4_batch_split_count = 0
+
+    def request_metrics(self):
+        with self._request_metrics_lock:
+            return {
+                'requests': self._v4_api_request_count,
+                'rpm_wait_seconds': self._v4_rpm_wait_seconds,
+                'batch_splits': self._v4_batch_split_count,
+            }
 
     def _select_api_key(self) -> Optional[str]:
         api_keys = self.multiple_keys_list
@@ -3636,29 +3862,28 @@ class LLM_API_Translator_V4(BaseTranslator):
             self.logger.error("No API keys provided in parameters.")
             return None
 
-        if not api_keys:
-            if self._respect_key_limit(single_key):
-                now = time.time()
-                count, start_time = self.key_usage.get(single_key, (0, now))
-                if now - start_time >= 60:
-                    count = 0
-                    start_time = now
-                self.key_usage[single_key] = (count + 1, start_time)
-                return single_key
-            return None
+        keys = api_keys or [single_key]
 
-        start_index = self.current_key_index
-        for i in range(len(api_keys)):
-            index = (start_index + i) % len(api_keys)
-            key = api_keys[index]
-            if self._respect_key_limit(key):
-                now = time.time()
-                count, start_time = self.key_usage.get(key, (0, now))
-                self.key_usage[key] = (count + 1, start_time)
-                self.current_key_index = (index + 1) % len(api_keys)
-                return key
-        self.logger.error("All available API keys are currently rate-limited.")
-        return None
+        def _on_wait(wait_seconds):
+            self.logger.warning(
+                f"All API keys reached the {self.max_rpm} RPM limit. "
+                f"Waiting {wait_seconds:.2f} seconds."
+            )
+
+        try:
+            key, waited = self._rpm_gate.reserve(
+                keys,
+                self.max_rpm,
+                stop_checker=lambda: _PIPELINE_ACTIVE and _V4_STOP_REQUESTED,
+                on_wait=_on_wait,
+            )
+        except InterruptedError:
+            raise
+
+        with self._request_metrics_lock:
+            self._v4_api_request_count += 1
+            self._v4_rpm_wait_seconds += waited
+        return key
 
     async def _request_translation(self, prompt: str, model_name: str = None) -> Optional[TranslationResponse]:
         if not model_name:
@@ -4698,6 +4923,8 @@ class LLM_API_Translator_V4(BaseTranslator):
         super().updateParam(param_key, param_content)
         if param_key in ["proxy", "multiple_keys", "apikey", "provider", "endpoint"]:
             self.client = None
+        if param_key in ["multiple_keys", "apikey", "max requests per minute"]:
+            self._rpm_gate.clear()
         if param_key == "autolayout_detail_logging":
             global _V4_AUTOLAYOUT_DETAIL_LOGGING
             _V4_AUTOLAYOUT_DETAIL_LOGGING = self.autolayout_detail_logging
@@ -4711,9 +4938,19 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
     V4: TRUE HEADLESS BACKGROUND SAVING (Parallel & Optimized).
     Executes entirely in background thread, updates UI via Signals.
     """
-    global _HEADLESS_SAVE_IN_PROGRESS, _V4_LAYOUT_START_TIME, _V4_LAYOUT_COMPLETED_COUNT
+    global _HEADLESS_SAVE_IN_PROGRESS, _V4_LAYOUT_START_TIME, _V4_LAYOUT_COMPLETED_COUNT, _V4_STOP_REQUESTED
     
     import time
+
+    if not _begin_v4_layout_run(
+        translate_thread,
+        reset_page_states=not wait_for_pipeline,
+    ):
+        if LOGGER:
+            LOGGER.info("Redundant layout/save run ignored; another run is already active.")
+        return False
+    if not wait_for_pipeline:
+        _V4_STOP_REQUESTED = False
     
     translate_thread._v4_layout_save_error = None
     if not hasattr(translate_thread, '_v4_layout_timing_lock'):
@@ -4731,7 +4968,14 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
     
     print("DEBUG: _v4_headless_save_entry called!")
     if LOGGER: LOGGER.info("🏁 V4: Starting Headless Background Save Sequence...")
-    
+
+    signaler = None
+    total_pages = 0
+    target_page_keys = []
+    stage_progress_lock = threading.Lock()
+    layout_completed_pages = set()
+    save_completed_pages = set()
+
     try:
         from qtpy.QtWidgets import QApplication
         from qtpy.QtGui import QImage, QPainter, QFont, QColor, QPen
@@ -4763,17 +5007,6 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
         if not hasattr(proj, '_v4_save_lock'):
             proj._v4_save_lock = threading.RLock()
 
-        # --- DEBOUNCE LOGIC (Prevent Double Saves) ---
-        import time
-        current_time = time.time()
-        last_save = getattr(proj, '_last_v4_save_timestamp', 0)
-        # Skip if saved less than 5 seconds ago
-        if not wait_for_pipeline and current_time - last_save < 5.0:
-            if LOGGER: LOGGER.info(f"Skipping redundant save request (Debounce: {current_time - last_save:.2f}s ago)")
-            return
-        proj._last_v4_save_timestamp = current_time
-        # ---------------------------------------------
-
         output_dir = proj.result_dir()
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -4792,6 +5025,7 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
             if LOGGER: LOGGER.info(f"Repair mode save: {len(img_keys_list)}/{len(proj.pages)} pages selected for rendering")
 
         total_pages = len(img_keys_list)
+        target_page_keys = list(img_keys_list)
 
         if LOGGER: LOGGER.info(f"Target: {total_pages} pages. Output: {output_dir}")
 
@@ -4808,17 +5042,31 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 # Create helper and move to main thread
                 # Attach to thread to prevent GC
                 _pipeline_start = getattr(translate_thread, '_v4_pipeline_start_time', None)
-                translate_thread._ui_helper = UIHelper(msgbox, proj, getattr(mainwindow, 'st_manager', None) if mainwindow else None, total_pages=total_pages, pipeline_start_time=_pipeline_start)
+                translate_thread._ui_helper = UIHelper(
+                    msgbox,
+                    proj,
+                    getattr(mainwindow, 'st_manager', None) if mainwindow else None,
+                    total_pages=total_pages,
+                    pipeline_start_time=_pipeline_start,
+                    translate_thread=translate_thread,
+                )
                 ui_helper = translate_thread._ui_helper
                 
                 ui_helper.moveToThread(mainwindow.thread())
                 
-                signaler.progress_signal.connect(ui_helper.update_ui)
+                signaler.layout_progress_signal.connect(ui_helper.update_layout_ui)
+                signaler.save_progress_signal.connect(ui_helper.update_save_ui)
                 signaler.finished_signal.connect(ui_helper.finish_ui)
         else:
             # Fallback if no UI (shouldn't happen)
             _pipeline_start = getattr(translate_thread, '_v4_pipeline_start_time', None)
-            ui_helper = UIHelper(None, proj, total_pages=total_pages, pipeline_start_time=_pipeline_start)
+            ui_helper = UIHelper(
+                None,
+                proj,
+                total_pages=total_pages,
+                pipeline_start_time=_pipeline_start,
+                translate_thread=translate_thread,
+            )
 
         if ui_helper is None:
             _pipeline_start = getattr(translate_thread, '_v4_pipeline_start_time', None)
@@ -4828,10 +5076,34 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 getattr(mainwindow, 'st_manager', None) if mainwindow else None,
                 total_pages=total_pages,
                 pipeline_start_time=_pipeline_start,
+                translate_thread=translate_thread,
             )
             if mainwindow:
                 ui_helper.moveToThread(mainwindow.thread())
             translate_thread._ui_helper = ui_helper
+        if not hasattr(translate_thread, '_v4_gui_invoke_lock'):
+            translate_thread._v4_gui_invoke_lock = threading.Lock()
+
+        def emit_stage_progress(stage, page_key):
+            completed_pages = (
+                layout_completed_pages if stage == 'layout' else save_completed_pages
+            )
+            with stage_progress_lock:
+                if page_key in completed_pages:
+                    return
+                completed_pages.add(page_key)
+                completed_count = len(completed_pages)
+            percent = int((completed_count / total_pages) * 100) if total_pages else 100
+            if stage == 'layout':
+                signaler.layout_progress_signal.emit(
+                    percent,
+                    f" (완료: {completed_count}/{total_pages})",
+                )
+            else:
+                signaler.save_progress_signal.emit(
+                    percent,
+                    f" (완료: {completed_count}/{total_pages})",
+                )
         
         # 3. Headless Render Function (Background Thread - Stable)
         def process_page_hybrid(page_key):
@@ -4943,12 +5215,20 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 _invoke_t0 = time.time()
                 _set_v4_layout_state(translate_thread, page_key, 'rendering')
                 _autolayout_detail_log('debug', f"[Save/invoke->] {page_key}")
-                QMetaObject.invokeMethod(
-                    ui_helper,
-                    "render_page_task",
-                    Qt.BlockingQueuedConnection,
-                    Q_ARG(str, page_key)
-                )
+                invoke_lock = translate_thread._v4_gui_invoke_lock
+                while not invoke_lock.acquire(timeout=0.05):
+                    if translate_thread.stop_requested or _V4_STOP_REQUESTED:
+                        _set_v4_layout_state(translate_thread, page_key, 'cancelled')
+                        return False
+                try:
+                    QMetaObject.invokeMethod(
+                        ui_helper,
+                        "render_page_task",
+                        Qt.BlockingQueuedConnection,
+                        Q_ARG(str, page_key)
+                    )
+                finally:
+                    invoke_lock.release()
                 prepared_stored = False
                 _V4_SAVE_HEARTBEAT = time.time()
                 _invoke_elapsed = _V4_SAVE_HEARTBEAT - _invoke_t0
@@ -4967,10 +5247,18 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 # Retrieve result
                 result_image = ui_helper.rendered_images.pop(page_key, None)
 
+                if translate_thread.stop_requested or _V4_STOP_REQUESTED:
+                    _set_v4_layout_state(translate_thread, page_key, 'cancelled')
+                    if LOGGER:
+                        LOGGER.info(f"Layout/save cancelled before image write: {page_key}")
+                    return False
+
                 if result_image is None or result_image.isNull():
                     if LOGGER: LOGGER.warning(f"Main thread returned null image for {page_key}")
                     _set_v4_layout_state(translate_thread, page_key, 'failed')
                     return False
+
+                emit_stage_progress('layout', page_key)
 
                 # 2. Save File (Background Thread - Slow I/O)
                 _set_v4_layout_state(translate_thread, page_key, 'saving')
@@ -4986,6 +5274,7 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 save_started = time.perf_counter()
                 if not result_image.save(save_path, quality=quality):
                     raise RuntimeError(f"QImage save failed: {save_path}")
+                emit_stage_progress('save', page_key)
                 _add_v4_layout_timing(
                     translate_thread,
                     'image_save',
@@ -5000,6 +5289,8 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                     del result_image
                 
                 _set_v4_layout_state(translate_thread, page_key, 'completed')
+                if hasattr(proj, 'append_progress_journal'):
+                    proj.append_progress_journal(page_key)
                 return True
                 
             except Exception as e:
@@ -5014,7 +5305,8 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                         ui_helper.prepared_pages.pop(page_key, None)
 
         # 4. Execute Parallel Rendering
-        signaler.progress_signal.emit(0, " (저장 시작...)")
+        signaler.layout_progress_signal.emit(0, " (대기 중)")
+        signaler.save_progress_signal.emit(0, " (대기 중)")
         
         # Max workers: Get from settings or default to 2
         max_workers = 2
@@ -5090,14 +5382,21 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 time.sleep(0.02)
                 
                 try:
-                    if not future.result():
+                    if not future.result() and not _V4_STOP_REQUESTED:
                         failed_pages.append(futures[future])
                 except Exception as e:
-                    failed_pages.append(futures[future])
-                    if LOGGER: LOGGER.error(f"Background save task failed: {e}")
+                    if not _V4_STOP_REQUESTED:
+                        failed_pages.append(futures[future])
+                        if LOGGER: LOGGER.error(f"Background save task failed: {e}")
+
+                if _V4_STOP_REQUESTED or translate_thread.stop_requested:
+                    _V4_STOP_REQUESTED = True
+                    for pending in futures:
+                        if pending is not future:
+                            pending.cancel()
+                    break
                 
                 completed += 1
-                percent = int((completed / total_pages) * 100)
                 
                 # [메모리 강화] 5페이지마다 GC + 적응형 CUDA 정리
                 if completed % 20 == 0:
@@ -5115,12 +5414,11 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                             gc.collect()
                     except Exception: pass
                 
-                if completed == total_pages:
-                    signaler.progress_signal.emit(100, " (저장 완료!)")
-                else:
-                    signaler.progress_signal.emit(percent, f" (저장 중: {completed}/{total_pages})")
         finally:
-            executor.shutdown(wait=True)
+            try:
+                executor.shutdown(wait=True, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=True)
             # Stop the watchdog thread; daemon, so it will also die with the process.
             try:
                 if _V4_WATCHDOG_STOP is not None:
@@ -5160,12 +5458,31 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
             )
 
         translate_thread._v4_save_completed = not failed_pages and not _V4_STOP_REQUESTED
+        with stage_progress_lock:
+            layout_completed_count = len(layout_completed_pages)
+            save_completed_count = len(save_completed_pages)
+        layout_percent = int((layout_completed_count / total_pages) * 100) if total_pages else 100
+        save_percent = int((save_completed_count / total_pages) * 100) if total_pages else 100
         if _V4_STOP_REQUESTED:
-            signaler.progress_signal.emit(0, " (저장 중단됨)")
+            signaler.layout_progress_signal.emit(
+                layout_percent,
+                f" (중단됨: {layout_completed_count}/{total_pages})",
+            )
+            signaler.save_progress_signal.emit(
+                save_percent,
+                f" (중단됨: {save_completed_count}/{total_pages})",
+            )
             if LOGGER:
                 LOGGER.warning("V4 incremental layout/save stopped; pending page data was cleared.")
         elif failed_pages:
-            signaler.progress_signal.emit(100, f" (저장 실패: {len(failed_pages)}페이지)")
+            signaler.layout_progress_signal.emit(
+                layout_percent,
+                f" (실패: {total_pages - layout_completed_count}, 완료: {layout_completed_count}/{total_pages})",
+            )
+            signaler.save_progress_signal.emit(
+                save_percent,
+                f" (실패: {total_pages - save_completed_count}, 완료: {save_completed_count}/{total_pages})",
+            )
         else:
             signaler.finished_signal.emit()
             if LOGGER:
@@ -5177,23 +5494,142 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
     except Exception as e:
         import traceback
         translate_thread._v4_layout_save_error = e
+        translate_thread._v4_save_completed = False
+        with stage_progress_lock:
+            layout_completed_count = len(layout_completed_pages)
+            save_completed_count = len(save_completed_pages)
+        translate_thread._v4_layout_failed_pages = (
+            set(target_page_keys) - save_completed_pages
+        )
+        if signaler is not None:
+            layout_percent = int((layout_completed_count / total_pages) * 100) if total_pages else 0
+            save_percent = int((save_completed_count / total_pages) * 100) if total_pages else 0
+            signaler.layout_progress_signal.emit(
+                layout_percent,
+                f" (실패: {max(0, total_pages - layout_completed_count)}, "
+                f"완료: {layout_completed_count}/{total_pages})",
+            )
+            signaler.save_progress_signal.emit(
+                save_percent,
+                f" (실패: {max(0, total_pages - save_completed_count)}, "
+                f"완료: {save_completed_count}/{total_pages})",
+            )
         err = f"🚨 V4 Save Critical Error: {e}\n{traceback.format_exc()}"
         if LOGGER: LOGGER.error(err)
         print(err)
     finally:
         # Always reset flag on exit (success or failure)
         _HEADLESS_SAVE_IN_PROGRESS = False
+        _end_v4_layout_run(translate_thread)
         # Safety net: ensure the watchdog thread is signaled to stop even if we
         # bail out before the inner finally runs.
         try:
             if _V4_WATCHDOG_STOP is not None:
                 _V4_WATCHDOG_STOP.set()
+        except InterruptedError:
+            raise
         except Exception:
             pass
         helper = getattr(translate_thread, '_ui_helper', None)
         if helper is not None and hasattr(helper, 'prepared_pages_lock'):
             with helper.prepared_pages_lock:
                 helper.prepared_pages.clear()
+
+def _v4_pop_translation_batch(queue, batch_pages, scheduled_pages, total_pages):
+    """Pop one full batch, or the final partial batch once all pages have arrived."""
+    if not queue:
+        return []
+    batch_pages = max(1, int(batch_pages))
+    remaining_pages = max(0, total_pages - scheduled_pages)
+    final_partial_ready = len(queue) >= remaining_pages
+    if len(queue) < batch_pages and not final_partial_ready:
+        return []
+    take_count = min(batch_pages, len(queue))
+    batch = list(queue[:take_count])
+    del queue[:take_count]
+    return batch
+
+
+def _v4_translation_value_failed(value) -> bool:
+    text = str(value or '').strip().lower()
+    return '[error:' in text or text.startswith('error:')
+
+
+def _v4_translate_page_batch(translate_thread, page_keys, split_depth=0):
+    """Translate pages atomically; recursively split failed multi-page requests."""
+    page_keys = list(page_keys)
+    if not page_keys:
+        return {}
+    if translate_thread.stop_requested or _V4_STOP_REQUESTED:
+        return {page_key: False for page_key in page_keys}
+
+    translator = translate_thread.translator
+    project_pages = translate_thread.imgtrans_proj.pages
+    started_at = time.perf_counter()
+
+    # A one-page leaf intentionally uses the established path, including its
+    # fallback model and final per-ID recovery behavior.
+    if len(page_keys) == 1:
+        page_key = page_keys[0]
+        blocks = project_pages.get(page_key, [])
+        eligible = translator._v4_eligible_translation_blocks(blocks)
+        try:
+            translator.translate_textblk_lst(blocks)
+            success = all(
+                not _v4_translation_value_failed(getattr(blk, 'translation', ''))
+                for blk in eligible
+            )
+            if LOGGER:
+                LOGGER.info(
+                    f"Translation batch leaf: pages=1 blocks={len(eligible)} "
+                    f"success={success} elapsed={time.perf_counter() - started_at:.2f}s"
+                )
+            return {page_key: success}
+        except Exception as exc:
+            if LOGGER:
+                LOGGER.error(f"Translation failed for {page_key}: {exc}")
+            return {page_key: False}
+
+    flattened_blocks = []
+    for page_key in page_keys:
+        flattened_blocks.extend(project_pages.get(page_key, []))
+    eligible_count = len(translator._v4_eligible_translation_blocks(flattened_blocks))
+
+    try:
+        translator.translate_textblk_batch_atomic(
+            flattened_blocks,
+            should_stop=lambda: translate_thread.stop_requested or _V4_STOP_REQUESTED,
+        )
+        if LOGGER:
+            LOGGER.info(
+                f"Translation batch complete: pages={len(page_keys)} blocks={eligible_count} "
+                f"elapsed={time.perf_counter() - started_at:.2f}s"
+            )
+        return {page_key: True for page_key in page_keys}
+    except InterruptedError:
+        return {page_key: False for page_key in page_keys}
+    except Exception as exc:
+        if translate_thread.stop_requested or _V4_STOP_REQUESTED:
+            return {page_key: False for page_key in page_keys}
+        midpoint = len(page_keys) // 2
+        left_pages = page_keys[:midpoint]
+        right_pages = page_keys[midpoint:]
+        with translator._request_metrics_lock:
+            translator._v4_batch_split_count += 1
+        if LOGGER:
+            LOGGER.warning(
+                f"Translation batch split: pages={len(page_keys)} blocks={eligible_count} "
+                f"depth={split_depth} reason={type(exc).__name__}: {exc}"
+            )
+        result = _v4_translate_page_batch(translate_thread, left_pages, split_depth + 1)
+        if not translate_thread.stop_requested and not _V4_STOP_REQUESTED:
+            result.update(
+                _v4_translate_page_batch(translate_thread, right_pages, split_depth + 1)
+            )
+        else:
+            result.update({page_key: False for page_key in right_pages})
+        return result
+
 
 def _run_translate_pipeline_patched(self):
     """
@@ -5286,13 +5722,24 @@ def _run_translate_pipeline_patched(self):
     self._v4_save_completed = False
     if not hasattr(self.imgtrans_proj, '_v4_save_lock'):
         self.imgtrans_proj._v4_save_lock = threading.RLock()
+    if hasattr(self.imgtrans_proj, 'enable_progress_journal'):
+        self.imgtrans_proj.enable_progress_journal(True)
+    self.imgtrans_proj._v4_save_interval = getattr(
+        self.translator, 'save_interval', 3.0
+    )
     layout_thread = None
     
     try:
         global _V4_STOP_REQUESTED
         _V4_STOP_REQUESTED = False
+        batch_pages = getattr(self.translator, 'translation_batch_pages', 10)
+        max_workers = getattr(self.translator, 'concurrent_images', 3)
+        self.translator.reset_request_metrics()
         if LOGGER:
-            LOGGER.info(f"🚀 V4 Parallel Processing: {target_num_pages} pages, {self.translator.concurrent_images} workers.")
+            LOGGER.info(
+                f"🚀 V4 Batch Translation: {target_num_pages} pages, "
+                f"up to {batch_pages} pages/request, {max_workers} concurrent batches."
+            )
 
         layout_thread = threading.Thread(
             target=_v4_headless_save_entry,
@@ -5303,7 +5750,6 @@ def _run_translate_pipeline_patched(self):
         )
         layout_thread.start()
 
-        max_workers = getattr(self.translator, 'concurrent_images', 3)
         save_interval = getattr(self.translator, 'save_interval', 3.0)
         initial_buffer = getattr(self.translator, 'initial_batch_buffer', 5)
         
@@ -5311,6 +5757,7 @@ def _run_translate_pipeline_patched(self):
         local_completed_count = 0
         last_save_time = 0.0
         completed_pages = []
+        scheduled_pages = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {}
@@ -5339,9 +5786,17 @@ def _run_translate_pipeline_patched(self):
                         continue
 
                 while len(futures) < max_workers and len(self.pipeline_pagekey_queue) > 0:
-                    page_key = self.pipeline_pagekey_queue.pop(0)
-                    future = executor.submit(self._translate_page, self.imgtrans_proj.pages, page_key, False)
-                    futures[future] = page_key
+                    page_batch = _v4_pop_translation_batch(
+                        self.pipeline_pagekey_queue,
+                        batch_pages,
+                        scheduled_pages,
+                        target_num_pages,
+                    )
+                    if not page_batch:
+                        break
+                    future = executor.submit(_v4_translate_page_batch, self, page_batch)
+                    futures[future] = page_batch
+                    scheduled_pages += len(page_batch)
                 
                 if not futures:
                     time.sleep(0.05)
@@ -5352,63 +5807,49 @@ def _run_translate_pipeline_patched(self):
                 )
 
                 for future in done:
-                    page_key = futures.pop(future)
-                    trans_success = True
+                    page_batch = futures.pop(future)
                     try:
-                        future.result()
+                        page_results = future.result()
                     except Exception as e:
-                        trans_success = False
+                        page_results = {page_key: False for page_key in page_batch}
                         if LOGGER:
-                            LOGGER.error(f"Translation failed for {page_key}: {e}")
+                            LOGGER.error(f"Translation batch failed for {page_batch}: {e}")
 
-                    local_completed_count += 1
-                    if trans_success:
-                        with _GLOBAL_SAVE_LOCK:
-                            if local_completed_count < target_num_pages:
-                                self.finished_counter += 1
-                                self.progress_changed.emit(self.finished_counter)
-                            
-                            self.imgtrans_proj.update_page_progress(page_key, RunStatus.FIN_TRANSLATE)
-                            with self._v4_layout_state_lock:
-                                self._v4_translated_pages.add(page_key)
-                            completed_pages.append(page_key)
-                            
-                            current_time = time.time()
-                            if self.finished_counter == 1 or current_time - last_save_time >= save_interval:
-                                if completed_pages:
-                                    # [버그 수정] OCR 완료 확인 후 저장
-                                    # 병렬 OCR 워커가 아직 blk.text를 쓰는 중인 페이지가
-                                    # 빈 상태로 저장되는 경쟁 조건을 방지한다.
-                                    # RunStatus.FIN_OCR 플래그는 run_ocr_step()이
-                                    # update_page_progress(imgname, RunStatus.FIN_OCR)를
-                                    # 호출한 직후 세팅되므로, 이 플래그가 있는 페이지는
-                                    # blk.text가 이미 확정된 상태임이 보장된다.
-                                    if RunStatus is not None:
+                    for page_key in page_batch:
+                        trans_success = bool(page_results.get(page_key, False))
+                        local_completed_count += 1
+                        if trans_success:
+                            with _GLOBAL_SAVE_LOCK:
+                                if local_completed_count < target_num_pages:
+                                    self.finished_counter += 1
+                                    self.progress_changed.emit(self.finished_counter)
+
+                                self.imgtrans_proj.update_page_progress(page_key, RunStatus.FIN_TRANSLATE)
+                                completed_pages.append(page_key)
+                                current_time = time.time()
+                                if self.finished_counter == 1 or current_time - last_save_time >= save_interval:
+                                    if RunStatus is None:
+                                        ocr_ready = list(completed_pages)
+                                    else:
                                         ocr_ready = [
                                             pk for pk in completed_pages
                                             if self.imgtrans_proj._image_info.get(pk, {}).get('finish_code', 0)
                                                & RunStatus.FIN_OCR
                                         ]
-                                        not_ready = len(completed_pages) - len(ocr_ready)
-                                        if not_ready > 0 and LOGGER:
-                                            LOGGER.debug(
-                                                f"Save deferred: {not_ready} page(s) waiting for OCR completion"
-                                            )
-                                        if ocr_ready:
-                                            self.imgtrans_proj.save()
-                                            completed_pages.clear()
-                                            last_save_time = current_time
-                                    else:
-                                        # RunStatus를 사용할 수 없는 환경 → 기존 동작 유지
+                                    if ocr_ready:
                                         self.imgtrans_proj.save()
-                                        completed_pages.clear()
+                                        completed_pages = [
+                                            pk for pk in completed_pages if pk not in set(ocr_ready)
+                                        ]
                                         last_save_time = current_time
-                    else:
-                        with self._v4_layout_state_lock:
-                            self._v4_translation_failed_pages.add(page_key)
-                        if local_completed_count < target_num_pages:
-                            self.finished_counter += 1
-                            self.progress_changed.emit(self.finished_counter)
+                            with self._v4_layout_state_lock:
+                                self._v4_translated_pages.add(page_key)
+                        else:
+                            with self._v4_layout_state_lock:
+                                self._v4_translation_failed_pages.add(page_key)
+                            if local_completed_count < target_num_pages:
+                                self.finished_counter += 1
+                                self.progress_changed.emit(self.finished_counter)
 
                     # [메모리 강화] 10페이지마다 주기적 GC + 적응형 CUDA 정리
                     if local_completed_count % 10 == 0:
@@ -5432,9 +5873,13 @@ def _run_translate_pipeline_patched(self):
 
         # --- ALL PAGES TRANSLATED ---
         if LOGGER:
+            request_metrics = self.translator.request_metrics()
             LOGGER.info(
                 f"Translation stage finished for {target_num_pages} pages; "
-                "waiting for incremental layout/save queue."
+                f"requests={request_metrics['requests']}, "
+                f"rpm_wait={request_metrics['rpm_wait_seconds']:.2f}s, "
+                f"batch_splits={request_metrics['batch_splits']}. "
+                "Waiting for incremental layout/save queue."
             )
 
         if layout_thread is not None:

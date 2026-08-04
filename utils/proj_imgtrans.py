@@ -1,4 +1,4 @@
-import os, json, shutil, re, docx, docx2txt, piexif, cv2
+import os, json, shutil, re, docx, docx2txt, piexif, cv2, threading, time
 from docx.shared import Inches
 from docx import Document
 import piexif.helper
@@ -108,8 +108,134 @@ class ProjImgTrans:
         self.img_array: np.ndarray = None
         self.mask_array: np.ndarray = None
         self.inpainted_array: np.ndarray = None
+        self._progress_journal_enabled = False
+        self._progress_journal_lock = threading.RLock()
+        self._v4_save_lock = threading.RLock()
         if directory is not None:
             self.load(directory)
+
+    def progress_journal_path(self) -> str:
+        if not self.proj_path:
+            return None
+        return self.proj_path + '.progress.jsonl'
+
+    def enable_progress_journal(self, enabled: bool = True):
+        self._progress_journal_enabled = bool(enabled)
+
+    def append_progress_journal(self, pagename: str):
+        """Append one complete page snapshot without rewriting the full project."""
+        if not self._progress_journal_enabled or pagename not in self.pages:
+            return
+        journal_path = self.progress_journal_path()
+        if not journal_path:
+            return
+
+        with self._v4_save_lock:
+            record = {
+                'version': 1,
+                'page': pagename,
+                'blocks': self.pages[pagename],
+                'image_info': self._image_info.get(pagename, {}),
+                'timestamp': time.time(),
+            }
+            encoded = (
+                json.dumps(record, ensure_ascii=False, cls=TextBlkEncoder) + '\n'
+            ).encode('utf-8')
+
+        with self._progress_journal_lock:
+            try:
+                with open(journal_path, 'ab') as journal:
+                    journal.write(encoded)
+                    journal.flush()
+            except OSError as exc:
+                # Recovery logging is best-effort. A temporarily unwritable
+                # journal must not turn a completed OCR/translation stage into
+                # a pipeline failure.
+                LOGGER.warning(
+                    f'Failed to append progress journal {journal_path}: {exc}'
+                )
+
+    def progress_journal_cutoff(self) -> int:
+        journal_path = self.progress_journal_path()
+        if not journal_path:
+            return 0
+        with self._progress_journal_lock:
+            try:
+                return osp.getsize(journal_path)
+            except OSError:
+                return 0
+
+    def compact_progress_journal(self, cutoff: int):
+        """Discard records included in a successful full save, preserving newer ones."""
+        if cutoff <= 0:
+            return
+        journal_path = self.progress_journal_path()
+        if not journal_path:
+            return
+        with self._progress_journal_lock:
+            try:
+                if not osp.exists(journal_path):
+                    return
+                with open(journal_path, 'rb') as journal:
+                    journal.seek(min(cutoff, osp.getsize(journal_path)))
+                    tail = journal.read()
+                if tail:
+                    tmp_path = journal_path + '.tmp'
+                    with open(tmp_path, 'wb') as journal:
+                        journal.write(tail)
+                        journal.flush()
+                    os.replace(tmp_path, journal_path)
+                else:
+                    os.remove(journal_path)
+            except OSError as exc:
+                # The full project file is already authoritative at this
+                # point. Keeping redundant journal records is safe; losing the
+                # completed save because compaction failed is not.
+                LOGGER.warning(
+                    f'Failed to compact progress journal {journal_path}: {exc}'
+                )
+
+    def replay_progress_journal(self) -> int:
+        """Replay valid page snapshots left by an interrupted run."""
+        journal_path = self.progress_journal_path()
+        if not journal_path or not osp.exists(journal_path):
+            return 0
+        self._progress_journal_enabled = True
+
+        recovered_pages = set()
+        with self._progress_journal_lock:
+            try:
+                with open(journal_path, 'r', encoding='utf-8') as journal:
+                    lines = journal.readlines()
+            except OSError as exc:
+                LOGGER.warning(f'Failed to read progress journal {journal_path}: {exc}')
+                return 0
+
+        for line_no, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                pagename = record['page']
+                if pagename not in self.pages:
+                    continue
+                self.pages[pagename] = [
+                    TextBlock(**blk_dict) for blk_dict in record.get('blocks', [])
+                ]
+                self._image_info.setdefault(pagename, {}).update(
+                    record.get('image_info', {})
+                )
+                recovered_pages.add(pagename)
+            except Exception as exc:
+                LOGGER.warning(
+                    f'Ignoring invalid progress journal record {line_no}: {exc}'
+                )
+
+        if recovered_pages:
+            LOGGER.info(
+                f'Recovered {len(recovered_pages)} page(s) from progress journal.'
+            )
+        return len(recovered_pages)
 
     def idx2pagename(self, idx: int) -> str:
         return self._idx2pagename[idx]
@@ -139,6 +265,7 @@ class ProjImgTrans:
             except Exception as e:
                 raise ProjectLoadFailureException(e)
             self.load_from_dict(proj_dict)
+        self.replay_progress_journal()
         if not osp.exists(self.inpainted_dir()):
             os.makedirs(self.inpainted_dir())
         if not osp.exists(self.mask_dir()):
@@ -216,10 +343,14 @@ class ProjImgTrans:
         return (fin_code & pcfg.module.finish_code) == pcfg.module.finish_code
 
     def set_page_progress(self, pagename, code):
-        self._image_info[pagename]['finish_code'] = code 
+        with self._v4_save_lock:
+            self._image_info[pagename]['finish_code'] = code
+        self.append_progress_journal(pagename)
 
     def update_page_progress(self, pagename, code):
-        self._image_info[pagename]['finish_code'] |= code 
+        with self._v4_save_lock:
+            self._image_info[pagename]['finish_code'] |= code
+        self.append_progress_journal(pagename)
 
     def load_translation_from_txt(self, file_path: str):
         page_list = parse_txt_translation(file_path)
@@ -336,6 +467,10 @@ class ProjImgTrans:
     def save(self, keep_exist_as_backup=False):
         if not osp.exists(self.directory):
             raise ProjectDirNotExistException
+        journal_cutoff = (
+            self.progress_journal_cutoff()
+            if self._progress_journal_enabled else 0
+        )
         tmp_save_tgt = self.proj_path + '.tmp'
         try:
             with open(tmp_save_tgt, "w", encoding="utf-8") as f:
@@ -347,6 +482,7 @@ class ProjImgTrans:
             os.replace(tmp_save_tgt, self.proj_path)
         else:
             os.replace(tmp_save_tgt, self.proj_path)
+        self.compact_progress_journal(journal_cutoff)
         LOGGER.debug(f'project saved to {self.proj_path}')
 
     def to_dict(self) -> Dict:

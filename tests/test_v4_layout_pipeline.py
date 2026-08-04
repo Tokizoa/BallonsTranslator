@@ -126,6 +126,24 @@ class V4LayoutPipelineTests(unittest.TestCase):
         layout_mod._add_v4_layout_timing(thread, 'area_prepare', 0.50)
         self.assertEqual(thread._v4_layout_timings['area_prepare'], 0.75)
 
+    def test_only_one_layout_run_can_enqueue_pages_at_a_time(self):
+        thread = SimpleNamespace(
+            _v4_layout_state_lock=threading.Lock(),
+            _v4_layout_states={'old-page.png': 'completed'},
+            _v4_layout_failed_pages={'old-page.png'},
+            _v4_save_completed=True,
+        )
+
+        self.assertTrue(layout_mod._begin_v4_layout_run(thread, reset_page_states=True))
+        self.assertEqual(thread._v4_layout_states, {})
+        self.assertEqual(thread._v4_layout_failed_pages, set())
+        self.assertFalse(thread._v4_save_completed)
+        self.assertFalse(layout_mod._begin_v4_layout_run(thread, reset_page_states=True))
+
+        layout_mod._end_v4_layout_run(thread)
+        self.assertTrue(layout_mod._begin_v4_layout_run(thread, reset_page_states=False))
+        layout_mod._end_v4_layout_run(thread)
+
     def test_worker_preparation_does_not_mutate_block_geometry(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = os.path.join(tmpdir, 'page.png')
@@ -162,6 +180,66 @@ class V4LayoutPipelineTests(unittest.TestCase):
         self.assertIn('QPainter(image)', source)
         self.assertIn("block_prep.get('mask')", source)
         self.assertIn('LOGGER.warning', source)
+
+        pipeline_source = inspect.getsource(layout_mod._v4_headless_save_entry)
+        self.assertIn('_begin_v4_layout_run', pipeline_source)
+        self.assertIn('_end_v4_layout_run', pipeline_source)
+        self.assertIn('_v4_gui_invoke_lock', pipeline_source)
+        self.assertIn('invoke_lock.acquire(timeout=0.05)', pipeline_source)
+        layout_done = pipeline_source.index("emit_stage_progress('layout', page_key)")
+        image_save = pipeline_source.index('result_image.save(')
+        save_done = pipeline_source.index("emit_stage_progress('save', page_key)")
+        self.assertLess(layout_done, image_save)
+        self.assertLess(image_save, save_done)
+
+        signaler = layout_mod.SaveSignaler()
+        self.assertTrue(hasattr(signaler, 'layout_progress_signal'))
+        self.assertTrue(hasattr(signaler, 'save_progress_signal'))
+        self.assertFalse(hasattr(signaler, 'progress_signal'))
+        self.assertNotIn(
+            'updateTranslateProgress',
+            inspect.getsource(layout_mod.UIHelper),
+        )
+
+    def test_stop_click_is_processed_while_render_waits_for_project_lock(self):
+        project_lock = threading.Lock()
+        project_lock.acquire()
+        translate_thread = SimpleNamespace(stop_requested=False)
+        project = SimpleNamespace(
+            pages={'page.png': []},
+            _v4_save_lock=project_lock,
+        )
+        helper = layout_mod.UIHelper(
+            None,
+            project,
+            total_pages=1,
+            translate_thread=translate_thread,
+        )
+
+        class _FakeApp:
+            def __init__(self):
+                self.calls = 0
+
+            def processEvents(self):
+                self.calls += 1
+                if self.calls >= 2:
+                    translate_thread.stop_requested = True
+
+        fake_app = _FakeApp()
+        try:
+            with mock.patch.object(layout_mod.QApplication, 'instance', return_value=fake_app), mock.patch.object(
+                layout_mod, '_V4_STOP_REQUESTED', False
+            ):
+                started = __import__('time').perf_counter()
+                helper.render_page_task('page.png')
+                elapsed = __import__('time').perf_counter() - started
+                self.assertTrue(layout_mod._V4_STOP_REQUESTED)
+        finally:
+            project_lock.release()
+
+        self.assertGreaterEqual(fake_app.calls, 2)
+        self.assertLess(elapsed, 0.5)
+        self.assertIsNone(helper.rendered_images['page.png'])
 
 
 if __name__ == '__main__':

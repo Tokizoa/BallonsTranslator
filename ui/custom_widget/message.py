@@ -173,12 +173,18 @@ class ImgtransProgressMessageBox(ProgressMessageBox):
         self.ocr_bar = TaskProgressBar(self.tr('OCR: '), True, self)
         self.inpaint_bar = TaskProgressBar(self.tr('Inpainting: '), True, self)
         self.translate_bar = TaskProgressBar(self.tr('Translating: '), True, self)
+        self.layout_bar = TaskProgressBar(self.tr('AutoLayout: '), True, self)
+        self.saving_bar = TaskProgressBar(self.tr('Saving: '), True, self)
 
         layout = self.layout()
         layout.addWidget(self.detect_bar)
         layout.addWidget(self.ocr_bar)
         layout.addWidget(self.inpaint_bar)
         layout.addWidget(self.translate_bar)
+        layout.addWidget(self.layout_bar)
+        layout.addWidget(self.saving_bar)
+        self.layout_bar.hide()
+        self.saving_bar.hide()
         
         # 添加停止按钮
         self.stop_button = QPushButton(self.tr('Stop'), self)
@@ -209,12 +215,28 @@ class ImgtransProgressMessageBox(ProgressMessageBox):
 
     def updateTranslateProgress(self, value: int, msg: str = ''):
         self.translate_bar.updateProgress(value, msg)
+
+    def updateLayoutProgress(self, value: int, msg: str = ''):
+        value = max(self.layout_bar.progressbar.value(), min(100, max(0, value)))
+        self.layout_bar.updateProgress(value, msg)
+
+    def updateSavingProgress(self, value: int, msg: str = ''):
+        value = max(self.saving_bar.progressbar.value(), min(100, max(0, value)))
+        self.saving_bar.updateProgress(value, msg)
+
+    def setV4BarsVisible(self, visible: bool):
+        self.layout_bar.setVisible(visible)
+        self.saving_bar.setVisible(visible)
     
     def zero_progress(self):
         self.updateDetectProgress(0)
         self.updateOCRProgress(0)
         self.updateInpaintProgress(0)
         self.updateTranslateProgress(0)
+        # Reset directly so a new run can move from 100 back to 0 while the
+        # public update methods remain monotonic within one run.
+        self.layout_bar.updateProgress(0)
+        self.saving_bar.updateProgress(0)
         # 重置停止按钮状态
         self.stop_button.setEnabled(True)
         self.stop_button.setText(self.tr('Stop'))
@@ -224,9 +246,13 @@ class ImgtransProgressMessageBox(ProgressMessageBox):
         self.ocr_bar.show()
         self.translate_bar.show()
         self.inpaint_bar.show()
+        self.layout_bar.show()
+        self.saving_bar.show()
 
     def hide_all_bars(self):
         self.detect_bar.hide()
         self.ocr_bar.hide()
         self.translate_bar.hide()
         self.inpaint_bar.hide()
+        self.layout_bar.hide()
+        self.saving_bar.hide()

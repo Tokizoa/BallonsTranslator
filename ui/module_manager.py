@@ -793,6 +793,10 @@ class ModuleManager(QObject):
         self.progress_msgbox.ocr_bar.setVisible(cfg_module.enable_ocr)
         self.progress_msgbox.translate_bar.setVisible(cfg_module.enable_translate)
         self.progress_msgbox.inpaint_bar.setVisible(cfg_module.enable_inpaint)
+        is_v4_pipeline = bool(
+            getattr(self.translate_thread.translator, 'use_image_batching', False)
+        )
+        self.progress_msgbox.setV4BarsVisible(is_v4_pipeline)
         self.progress_msgbox.zero_progress()
         self.progress_msgbox.show()
         self.imgtrans_thread.runImgtransPipeline(self.imgtrans_proj, pages_to_process)
