@@ -1,4 +1,5 @@
 import time
+import threading
 from typing import Union, List, Dict, Callable
 import os.path as osp
 
@@ -84,6 +85,13 @@ class ModuleThread(QThread):
 
     def requestStop(self):
         self.stop_requested = True
+        renderer_supervisor = getattr(self, '_v4_render_supervisor', None)
+        if renderer_supervisor is not None:
+            threading.Thread(
+                target=renderer_supervisor.cancel,
+                name='V4RendererCancel',
+                daemon=True,
+            ).start()
 
     def run(self):
         if self.job is not None:
@@ -166,6 +174,7 @@ class TranslateThread(ModuleThread):
 
     finish_translate_page = Signal(str)
     progress_changed = Signal(int)
+    v4_prepare_page = Signal(str)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__('translator', TRANSLATORS, *args, **kwargs)
@@ -223,6 +232,17 @@ class TranslateThread(ModuleThread):
 
     def push_pagekey_queue(self, page_key: str):
         self.pipeline_pagekey_queue.append(page_key)
+
+    def acknowledge_v4_page_prepared(self, page_key: str):
+        """Release the V4 renderer only after GUI-owned text settings are applied."""
+        prepare_lock = getattr(self, '_v4_page_prepare_lock', None)
+        prepare_events = getattr(self, '_v4_page_prepare_events', None)
+        if prepare_lock is None or prepare_events is None:
+            return
+        with prepare_lock:
+            event = prepare_events.get(page_key)
+        if event is not None:
+            event.set()
 
     def runTranslatePipeline(self, imgtrans_proj: ProjImgTrans):
         self.initImgtransPipeline(imgtrans_proj)
@@ -652,6 +672,7 @@ class ModuleManager(QObject):
     imgtrans_pipeline_finished = Signal()
     blktrans_pipeline_finished = Signal(int, list)
     page_trans_finished = Signal(int)
+    v4_prepare_page = Signal(str)
 
     run_canvas_inpaint = False
     is_waiting_th = False
@@ -673,6 +694,7 @@ class ModuleManager(QObject):
         self.translate_thread = TranslateThread()
         self.translate_thread.progress_changed.connect(self.on_update_translate_progress)
         self.translate_thread.finish_translate_page.connect(self.on_finish_translate_page)  
+        self.translate_thread.v4_prepare_page.connect(self.on_v4_prepare_page)
 
         self.inpaint_thread = InpaintThread()
         self.inpaint_thread.finish_inpaint.connect(self.on_finish_inpaint)
@@ -840,7 +862,7 @@ class ModuleManager(QObject):
             shared.pbar['detect'].update(1)
         progress = int(progress / self.imgtrans_thread.num_pages * 100)
         self.progress_msgbox.updateDetectProgress(progress)
-        if ri != self.last_finished_index:
+        if not self._is_v4_pipeline() and ri != self.last_finished_index:
             self.last_finished_index = ri
             self.page_trans_finished.emit(ri)
         if progress == 100:
@@ -852,7 +874,7 @@ class ModuleManager(QObject):
             shared.pbar['ocr'].update(1)
         progress = int(progress / self.imgtrans_thread.num_pages * 100)
         self.progress_msgbox.updateOCRProgress(progress)
-        if ri != self.last_finished_index:
+        if not self._is_v4_pipeline() and ri != self.last_finished_index:
             self.last_finished_index = ri
             self.page_trans_finished.emit(ri)
         if progress == 100:
@@ -864,7 +886,7 @@ class ModuleManager(QObject):
             shared.pbar['translate'].update(1)
         progress = int(progress / self.imgtrans_thread.num_pages * 100)
         self.progress_msgbox.updateTranslateProgress(progress)
-        if ri != self.last_finished_index:
+        if not self._is_v4_pipeline() and ri != self.last_finished_index:
             self.last_finished_index = ri
             self.page_trans_finished.emit(ri)
         if progress == 100:
@@ -876,7 +898,7 @@ class ModuleManager(QObject):
             shared.pbar['inpaint'].update(1)
         progress = int(progress / self.imgtrans_thread.num_pages * 100)
         self.progress_msgbox.updateInpaintProgress(progress)
-        if ri != self.last_finished_index:
+        if not self._is_v4_pipeline() and ri != self.last_finished_index:
             self.last_finished_index = ri
             self.page_trans_finished.emit(ri)
         if progress == 100:
@@ -956,6 +978,17 @@ class ModuleManager(QObject):
 
     def on_finish_translate_page(self, page_key: str):
         self.finish_translate_page.emit(page_key)
+
+    def _is_v4_pipeline(self) -> bool:
+        translator = getattr(self.translate_thread, 'translator', None)
+        return bool(getattr(translator, 'use_image_batching', False))
+
+    def on_v4_prepare_page(self, page_key: str):
+        """Apply only GUI-owned text settings; never switch canvas or save here."""
+        try:
+            self.v4_prepare_page.emit(page_key)
+        finally:
+            self.translate_thread.acknowledge_v4_page_prepared(page_key)
     
     def on_finish_inpaint(self, inpaint_dict: dict):
         if self.run_canvas_inpaint:

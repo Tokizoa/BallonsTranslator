@@ -1545,7 +1545,7 @@ def _install_patches():
                         # or contains untranslated Japanese text (when source also had Japanese).
                         if LOGGER: LOGGER.info("Repair mode: scanning for error/empty/blank/untranslated Japanese translations...")
 
-                        jp_char_regex = re.compile(r'[\u3040-\u309f\u30a0-\u30ff]')
+                        jp_char_regex = re.compile(r'[\u3040-\u309f\u30a0-\u30ff\u30fb\u30fc]')
                         # A translated box can legitimately retain a Japanese name,
                         # SFX, or quoted phrase.  Treat it as untranslated only when
                         # it contains no Korean at all (syllables or jamo).
@@ -2128,11 +2128,13 @@ class UIHelper(QObject):
         total_pages=None,
         pipeline_start_time=None,
         translate_thread=None,
+        heartbeat_callback=None,
     ):
         super().__init__()
         self.msgbox = msgbox
         self.proj = proj
         self.translate_thread = translate_thread
+        self.heartbeat_callback = heartbeat_callback
         self.stm = stm # [NEW] SceneTextManager for layout/refresh
         self.rendered_images = {} # Thread-safe storage for cross-thread return values
         self.render_timings = {}
@@ -2143,8 +2145,23 @@ class UIHelper(QObject):
         self._layout_total_pages = total_pages if total_pages is not None else (len(proj.pages) if proj else 0)
         self._pipeline_start_time = pipeline_start_time  # Track overall pipeline start time
 
+    def emit_render_heartbeat(
+        self,
+        stage,
+        page_key,
+        block_index=None,
+        block_count=None,
+    ):
+        if self.heartbeat_callback is not None:
+            self.heartbeat_callback(
+                stage,
+                page_key,
+                block_index,
+                block_count,
+            )
+
     def process_events_and_check_stop(self):
-        """Keep the progress dialog clickable while a page renders on the GUI thread."""
+        """Pump the isolated renderer's Qt queue and honor local cancellation."""
         global _V4_STOP_REQUESTED
         app = QApplication.instance()
         if app is not None:
@@ -2221,15 +2238,16 @@ class UIHelper(QObject):
                 print(f"Notification Error: {e}")
 
     # ----------------------------------------------------------------------
-    # HYBRID RENDERING: Run heavily GUI-dependent logic on Main Thread
+    # QT RENDERING: executed on the isolated renderer process' Qt thread
     # ----------------------------------------------------------------------
     @Slot(str)
     def render_page_task(self, page_key):
         """
-        Renders the page to a QImage on the Main Thread.
+        Renders the page to a QImage on the current process' Qt thread.
         Stores result in self.rendered_images[page_key]
         """
         render_started = time.perf_counter()
+        self.emit_render_heartbeat("render_start", page_key)
         if self.process_events_and_check_stop():
             self.rendered_images[page_key] = None
             self.render_timings[page_key] = time.perf_counter() - render_started
@@ -2287,12 +2305,12 @@ class UIHelper(QObject):
                 self.rendered_images[page_key] = None
                 return
 
-            # Setup Scene (Main Thread Safe)
+            # Setup Scene on the renderer process' Qt thread.
             scene = QGraphicsScene()
             scene.setSceneRect(0, 0, image.width(), image.height())
             
             # Add Background (Z=0)
-            # QGraphicsPixmapItem might need QPixmap, which is fine in Main Thread
+            # QGraphicsPixmapItem/QPixmap stay inside this Qt process.
             bg_pixmap = QPixmap.fromImage(image)
             bg_item = QGraphicsPixmapItem(bg_pixmap)
             bg_item.setZValue(0)
@@ -2321,6 +2339,7 @@ class UIHelper(QObject):
             global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO, _V4_HEADLESS_LAYOUT_CALL
             render_cancelled = False
             for i, blk in enumerate(blk_list):
+                self.emit_render_heartbeat("block_start", page_key, i, len(blk_list))
                 if self.process_events_and_check_stop():
                     render_cancelled = True
                     break
@@ -2344,7 +2363,7 @@ class UIHelper(QObject):
                     if hasattr(blk, 'vertical'):
                         blk.vertical = False
 
-                    # TextBlkItem requires Main Thread for FontMetrics & Layouts
+                    # TextBlkItem requires the owning QApplication thread.
                     text_item = TextBlkItem(blk, idx=i, set_format=True, show_rect=False)
                     text_item.setZValue(10) # Ensure it's above background
                     scene.addItem(text_item)
@@ -2457,6 +2476,7 @@ class UIHelper(QObject):
                     else:
                         print(f"V4 Render: Failed to add TextBlkItem {i} in {page_key}: {item_err}")
                         traceback.print_exc()
+                self.emit_render_heartbeat("block_complete", page_key, i, len(blk_list))
 
             if render_cancelled or self.process_events_and_check_stop():
                 scene.clear()
@@ -2466,6 +2486,7 @@ class UIHelper(QObject):
                 return
 
             # Render
+            self.emit_render_heartbeat("scene_render_start", page_key)
             painter = QPainter(image)
             painter.setRenderHint(QPainter.Antialiasing)
             painter.setRenderHint(QPainter.TextAntialiasing)
@@ -2473,6 +2494,7 @@ class UIHelper(QObject):
             
             scene.render(painter)
             painter.end()
+            self.emit_render_heartbeat("scene_render_complete", page_key)
             
             # [메모리 누수 수정] Qt 객체 명시적 해제
             # scene.clear() already destroys all child items including bg_item.
@@ -2501,7 +2523,7 @@ class UIHelper(QObject):
             self.rendered_images[page_key] = image
             
         except Exception as e:
-            print(f"Render Error on Main Thread: {e}")
+            print(f"Render Error in Qt renderer process: {e}")
             import traceback
             traceback.print_exc()
             self.rendered_images[page_key] = None
@@ -4975,10 +4997,10 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
     stage_progress_lock = threading.Lock()
     layout_completed_pages = set()
     save_completed_pages = set()
+    renderer_supervisor = None
 
     try:
         from qtpy.QtWidgets import QApplication
-        from qtpy.QtGui import QImage, QPainter, QFont, QColor, QPen
         import os
         
         # 1. Setup Signaler for UI Updates
@@ -5081,9 +5103,6 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
             if mainwindow:
                 ui_helper.moveToThread(mainwindow.thread())
             translate_thread._ui_helper = ui_helper
-        if not hasattr(translate_thread, '_v4_gui_invoke_lock'):
-            translate_thread._v4_gui_invoke_lock = threading.Lock()
-
         def emit_stage_progress(stage, page_key):
             completed_pages = (
                 layout_completed_pages if stage == 'layout' else save_completed_pages
@@ -5104,10 +5123,53 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                     percent,
                     f" (완료: {completed_count}/{total_pages})",
                 )
+
+        from modules.translators.v4_render_worker import (
+            V4RenderSupervisor,
+            encode_text_blocks,
+            make_render_request,
+        )
+        from utils import shared as shared_runtime
+        from utils.textblock import TextBlock
+
+        render_settings = {
+            'ldpi': shared_runtime.LDPI,
+            'default_font_family': shared_runtime.DEFAULT_FONT_FAMILY,
+            'app_default_font': shared_runtime.APP_DEFAULT_FONT,
+            'translate_source': pcfg.module.translate_source,
+            'translate_target': pcfg.module.translate_target,
+            'let_autolayout_flag': pcfg.let_autolayout_flag,
+            'let_fntsize_flag': pcfg.let_fntsize_flag,
+        }
+        renderer_supervisor = V4RenderSupervisor(render_settings, worker_count=2)
+        translate_thread._v4_render_supervisor = renderer_supervisor
+        render_run_id = f"{int(time.time() * 1000)}-{id(translate_thread)}"
+        if total_pages and not renderer_supervisor.start():
+            raise RuntimeError("V4 Qt renderer processes could not be started.")
+
+        def apply_rendered_blocks(page_key, blocks_json):
+            block_dicts = json.loads(blocks_json)
+            rendered_blocks = [TextBlock(**block_dict) for block_dict in block_dicts]
+            with proj._v4_save_lock:
+                current_blocks = proj.pages.get(page_key, [])
+                if len(current_blocks) != len(rendered_blocks):
+                    raise RuntimeError(
+                        f"Rendered block count mismatch for {page_key}: "
+                        f"{len(rendered_blocks)} != {len(current_blocks)}"
+                    )
+                for current, rendered, block_dict in zip(
+                    current_blocks,
+                    rendered_blocks,
+                    block_dicts,
+                ):
+                    for field_name in block_dict:
+                        if field_name == 'fontformat':
+                            vars(current.fontformat).update(vars(rendered.fontformat))
+                        else:
+                            setattr(current, field_name, getattr(rendered, field_name))
         
         # 3. Headless Render Function (Background Thread - Stable)
         def process_page_hybrid(page_key):
-            prepared_stored = False
             try:
                 if not _claim_v4_layout_page(translate_thread, page_key):
                     if LOGGER:
@@ -5179,115 +5241,85 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                     time.sleep(0.2)
 
                 _set_v4_layout_state(translate_thread, page_key, 'preparing')
-                prepared_page = _prepare_layout_page(
-                    proj,
-                    page_key,
-                    bool(ui_helper.stm and pcfg.let_autolayout_flag),
-                )
-                with ui_helper.prepared_pages_lock:
-                    ui_helper.prepared_pages[page_key] = prepared_page
-                prepared_stored = True
-                _add_v4_layout_timing(
-                    translate_thread,
-                    'area_prepare',
-                    prepared_page['prepare_seconds'],
-                )
-                _autolayout_detail_log(
-                    'debug',
-                    f"[Layout/prepare] {page_key} "
-                    f"({prepared_page['prepare_seconds']:.3f}s)",
-                )
-
-                # Use invokeMethod to run render_page_task on Main Thread (Blocking)
-                # This ensures we use the exact same rendering logic (TextBlkItem) as the GUI
-                from qtpy.QtCore import QMetaObject, Q_ARG, Qt
-
-                if not ui_helper:
-                    if LOGGER: LOGGER.error("UIHelper is None")
-                    return False
-
-                # Call render_page_task(page_key) on the main thread
-                # We do not use Q_RETURN_ARG as it causes issues in some PyQt6 versions.
-                # Instead, we rely on the thread-safe dictionary in UIHelper.
-                global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO
-                _V4_SAVE_HEARTBEAT = time.time()
-                _V4_SAVE_HEARTBEAT_INFO = f"invoke->render:{page_key}"
-                _invoke_t0 = time.time()
-                _set_v4_layout_state(translate_thread, page_key, 'rendering')
-                _autolayout_detail_log('debug', f"[Save/invoke->] {page_key}")
-                invoke_lock = translate_thread._v4_gui_invoke_lock
-                while not invoke_lock.acquire(timeout=0.05):
-                    if translate_thread.stop_requested or _V4_STOP_REQUESTED:
-                        _set_v4_layout_state(translate_thread, page_key, 'cancelled')
-                        return False
-                try:
-                    QMetaObject.invokeMethod(
-                        ui_helper,
-                        "render_page_task",
-                        Qt.BlockingQueuedConnection,
-                        Q_ARG(str, page_key)
-                    )
-                finally:
-                    invoke_lock.release()
-                prepared_stored = False
-                _V4_SAVE_HEARTBEAT = time.time()
-                _invoke_elapsed = _V4_SAVE_HEARTBEAT - _invoke_t0
-                _render_elapsed = ui_helper.render_timings.pop(page_key, _invoke_elapsed)
-                _add_v4_layout_timing(translate_thread, 'qt_render', _render_elapsed)
-                if LOGGER:
-                    if _invoke_elapsed > 30:
-                        LOGGER.warning(
-                            f"[Save/invoke] Slow render: {page_key} took {_invoke_elapsed:.1f}s"
-                        )
-                _autolayout_detail_log(
-                    'debug',
-                    f"[Save/invoke/ok] {page_key} ({_invoke_elapsed:.2f}s)",
-                )
-
-                # Retrieve result
-                result_image = ui_helper.rendered_images.pop(page_key, None)
-
-                if translate_thread.stop_requested or _V4_STOP_REQUESTED:
-                    _set_v4_layout_state(translate_thread, page_key, 'cancelled')
-                    if LOGGER:
-                        LOGGER.info(f"Layout/save cancelled before image write: {page_key}")
-                    return False
-
-                if result_image is None or result_image.isNull():
-                    if LOGGER: LOGGER.warning(f"Main thread returned null image for {page_key}")
-                    _set_v4_layout_state(translate_thread, page_key, 'failed')
-                    return False
-
-                emit_stage_progress('layout', page_key)
-
-                # 2. Save File (Background Thread - Slow I/O)
-                _set_v4_layout_state(translate_thread, page_key, 'saving')
                 ext = getattr(pcfg, 'imgsave_ext', '.png')
                 if not ext.startswith('.'): ext = '.' + ext
-                
                 save_path = os.path.join(output_dir, os.path.splitext(page_key)[0] + ext)
-                
                 quality = -1
                 if hasattr(pcfg, 'imgsave_quality') and pcfg.imgsave_quality is not None:
                     quality = int(pcfg.imgsave_quality)
-                
-                save_started = time.perf_counter()
-                if not result_image.save(save_path, quality=quality):
-                    raise RuntimeError(f"QImage save failed: {save_path}")
-                emit_stage_progress('save', page_key)
-                _add_v4_layout_timing(
-                    translate_thread,
-                    'image_save',
-                    time.perf_counter() - save_started,
+
+                input_path = proj.get_inpainted_path(page_key)
+                if not os.path.exists(input_path):
+                    input_path = os.path.join(proj.directory, page_key)
+                if not os.path.exists(input_path):
+                    raise RuntimeError(f"Render input does not exist: {input_path}")
+
+                with proj._v4_save_lock:
+                    blocks_json = encode_text_blocks(proj.pages.get(page_key, []))
+                request = make_render_request(
+                    page_key,
+                    input_path,
+                    save_path,
+                    quality,
+                    blocks_json,
+                    render_settings,
+                    run_id=render_run_id,
                 )
-        
-                # [메모리 강화] sip.delete로 Qt C++ 메모리 즉시 해제
-                try:
-                    import sip
-                    sip.delete(result_image)
-                except Exception:
-                    del result_image
-                
+
+                def on_render_event(event):
+                    global _V4_SAVE_HEARTBEAT, _V4_SAVE_HEARTBEAT_INFO
+                    event_type = event.get('type', 'unknown')
+                    event_stage = event.get('stage', event_type)
+                    block_index = event.get('block_index')
+                    block_count = event.get('block_count')
+                    _V4_SAVE_HEARTBEAT = time.time()
+                    _V4_SAVE_HEARTBEAT_INFO = (
+                        f"worker:{page_key}:{event_stage}"
+                        if block_index is None
+                        else f"worker:{page_key}:{event_stage}:{block_index}/{block_count}"
+                    )
+                    if event_type == 'layout_complete':
+                        _set_v4_layout_state(translate_thread, page_key, 'saving')
+                        emit_stage_progress('layout', page_key)
+                    elif event_type == 'retry' and LOGGER:
+                        LOGGER.warning(
+                            f"Renderer retry for {page_key}: attempt "
+                            f"{event.get('attempt')} ({event.get('error')})"
+                        )
+
+                _set_v4_layout_state(translate_thread, page_key, 'rendering')
+                result = renderer_supervisor.render(
+                    request,
+                    on_event=on_render_event,
+                    should_stop=lambda: bool(
+                        translate_thread.stop_requested or _V4_STOP_REQUESTED
+                    ),
+                )
+                if result.cancelled:
+                    _set_v4_layout_state(translate_thread, page_key, 'cancelled')
+                    return False
+                if not result.success:
+                    if LOGGER:
+                        LOGGER.error(
+                            f"Renderer failed for {page_key} after {result.attempts} "
+                            f"attempt(s): {result.error}"
+                        )
+                    _set_v4_layout_state(translate_thread, page_key, 'failed')
+                    return False
+                if result.attempts > 1 and LOGGER:
+                    LOGGER.warning(
+                        f"Renderer recovered {page_key} on attempt {result.attempts}."
+                    )
+
+                apply_rendered_blocks(page_key, result.blocks_json)
+                for timing_name, duration in (result.timings or {}).items():
+                    if timing_name in ('area_prepare', 'qt_render', 'image_save'):
+                        _add_v4_layout_timing(
+                            translate_thread,
+                            timing_name,
+                            duration,
+                        )
+                emit_stage_progress('save', page_key)
                 _set_v4_layout_state(translate_thread, page_key, 'completed')
                 if hasattr(proj, 'append_progress_journal'):
                     proj.append_progress_journal(page_key)
@@ -5299,24 +5331,15 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 import traceback
                 if LOGGER: LOGGER.error(traceback.format_exc())
                 return False
-            finally:
-                if prepared_stored and ui_helper is not None:
-                    with ui_helper.prepared_pages_lock:
-                        ui_helper.prepared_pages.pop(page_key, None)
-
         # 4. Execute Parallel Rendering
         signaler.layout_progress_signal.emit(0, " (대기 중)")
         signaler.save_progress_signal.emit(0, " (대기 중)")
         
-        # Max workers: Get from settings or default to 2
+        # Exactly two persistent Qt processes are used. The controller threads
+        # only wait for IPC and never execute Qt rendering themselves.
         max_workers = 2
-        if hasattr(translate_thread, 'translator') and hasattr(translate_thread.translator, 'concurrent_saves'):
-             max_workers = translate_thread.translator.concurrent_saves
-             
-        # Limit max_workers to prevent RAM explosion with large images
-        if max_workers > 4: max_workers = 4
-        
-        if LOGGER: LOGGER.info(f"V4 Save: Using {max_workers} concurrent save threads.")
+        if LOGGER:
+            LOGGER.info(f"V4 Save: Using {max_workers} isolated Qt renderer processes.")
 
         # [Watchdog] Diagnostic-only: if no save progress for a long time, dump all
         # thread stacks to the log. Never kills the process, never skips pages.
@@ -5391,6 +5414,7 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
 
                 if _V4_STOP_REQUESTED or translate_thread.stop_requested:
                     _V4_STOP_REQUESTED = True
+                    renderer_supervisor.cancel()
                     for pending in futures:
                         if pending is not future:
                             pending.cancel()
@@ -5419,6 +5443,8 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
                 executor.shutdown(wait=True, cancel_futures=True)
             except TypeError:
                 executor.shutdown(wait=True)
+            if renderer_supervisor is not None:
+                renderer_supervisor.shutdown()
             # Stop the watchdog thread; daemon, so it will also die with the process.
             try:
                 if _V4_WATCHDOG_STOP is not None:
@@ -5520,6 +5546,9 @@ def _v4_headless_save_entry(translate_thread, proj=None, wait_for_pipeline=False
     finally:
         # Always reset flag on exit (success or failure)
         _HEADLESS_SAVE_IN_PROGRESS = False
+        if renderer_supervisor is not None:
+            renderer_supervisor.shutdown()
+        translate_thread._v4_render_supervisor = None
         _end_v4_layout_run(translate_thread)
         # Safety net: ensure the watchdog thread is signaled to stop even if we
         # bail out before the inner finally runs.
@@ -5553,6 +5582,46 @@ def _v4_pop_translation_batch(queue, batch_pages, scheduled_pages, total_pages):
 def _v4_translation_value_failed(value) -> bool:
     text = str(value or '').strip().lower()
     return '[error:' in text or text.startswith('error:')
+
+
+def _v4_prepare_translated_page_for_render(
+    translate_thread,
+    page_key,
+    timeout_seconds=30.0,
+):
+    """Wait for lightweight GUI-owned text formatting before renderer submission."""
+    if not hasattr(translate_thread, '_v4_page_prepare_lock'):
+        translate_thread._v4_page_prepare_lock = threading.Lock()
+    if not hasattr(translate_thread, '_v4_page_prepare_events'):
+        translate_thread._v4_page_prepare_events = {}
+
+    prepared = threading.Event()
+    with translate_thread._v4_page_prepare_lock:
+        translate_thread._v4_page_prepare_events[page_key] = prepared
+
+    try:
+        prepare_signal = getattr(translate_thread, 'v4_prepare_page', None)
+        if prepare_signal is None:
+            if LOGGER:
+                LOGGER.error(f'V4 GUI preparation signal is unavailable: {page_key}')
+            return False
+        prepare_signal.emit(page_key)
+
+        deadline = time.monotonic() + timeout_seconds
+        while not prepared.wait(0.05):
+            if translate_thread.stop_requested or _V4_STOP_REQUESTED:
+                return False
+            if time.monotonic() >= deadline:
+                if LOGGER:
+                    LOGGER.error(
+                        f'V4 GUI text preparation timed out after '
+                        f'{timeout_seconds:.0f}s: {page_key}'
+                    )
+                return False
+        return True
+    finally:
+        with translate_thread._v4_page_prepare_lock:
+            translate_thread._v4_page_prepare_events.pop(page_key, None)
 
 
 def _v4_translate_page_batch(translate_thread, page_keys, split_depth=0):
@@ -5817,6 +5886,11 @@ def _run_translate_pipeline_patched(self):
 
                     for page_key in page_batch:
                         trans_success = bool(page_results.get(page_key, False))
+                        if trans_success:
+                            trans_success = _v4_prepare_translated_page_for_render(
+                                self,
+                                page_key,
+                            )
                         local_completed_count += 1
                         if trans_success:
                             with _GLOBAL_SAVE_LOCK:
@@ -5988,6 +6062,13 @@ def _run_translate_pipeline_patched(self):
         # ALWAYS restore flags on exit
         _V4_GUI_LAYOUT_ENABLED = True
         _PIPELINE_ACTIVE = False
+        prepare_lock = getattr(self, '_v4_page_prepare_lock', None)
+        prepare_events = getattr(self, '_v4_page_prepare_events', None)
+        if prepare_lock is not None and prepare_events is not None:
+            with prepare_lock:
+                for event in prepare_events.values():
+                    event.set()
+                prepare_events.clear()
         
     # Notification is now handled in UIHelper.finish_ui (Main Thread)
     # _show_completion_notification()

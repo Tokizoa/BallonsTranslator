@@ -1,8 +1,10 @@
+import ast
 import inspect
 import os
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -10,6 +12,7 @@ import numpy as np
 from qtpy.QtGui import QImage, QColor
 
 from modules.translators import trans_llm_api_v4 as layout_mod
+from modules.translators import v4_render_worker as worker_mod
 
 
 class _CaptureLogger:
@@ -144,6 +147,29 @@ class V4LayoutPipelineTests(unittest.TestCase):
         self.assertTrue(layout_mod._begin_v4_layout_run(thread, reset_page_states=False))
         layout_mod._end_v4_layout_run(thread)
 
+    def test_renderer_waits_for_keyed_gui_text_preparation(self):
+        thread = SimpleNamespace(
+            stop_requested=False,
+            _v4_page_prepare_lock=threading.Lock(),
+            _v4_page_prepare_events={},
+        )
+
+        class _ImmediatePrepareSignal:
+            def emit(self, page_key):
+                with thread._v4_page_prepare_lock:
+                    thread._v4_page_prepare_events[page_key].set()
+
+        thread.v4_prepare_page = _ImmediatePrepareSignal()
+        with mock.patch.object(layout_mod, '_V4_STOP_REQUESTED', False):
+            self.assertTrue(
+                layout_mod._v4_prepare_translated_page_for_render(
+                    thread,
+                    'page.png',
+                    timeout_seconds=0.1,
+                )
+            )
+        self.assertEqual(thread._v4_page_prepare_events, {})
+
     def test_worker_preparation_does_not_mutate_block_geometry(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = os.path.join(tmpdir, 'page.png')
@@ -184,11 +210,14 @@ class V4LayoutPipelineTests(unittest.TestCase):
         pipeline_source = inspect.getsource(layout_mod._v4_headless_save_entry)
         self.assertIn('_begin_v4_layout_run', pipeline_source)
         self.assertIn('_end_v4_layout_run', pipeline_source)
-        self.assertIn('_v4_gui_invoke_lock', pipeline_source)
-        self.assertIn('invoke_lock.acquire(timeout=0.05)', pipeline_source)
-        layout_done = pipeline_source.index("emit_stage_progress('layout', page_key)")
-        image_save = pipeline_source.index('result_image.save(')
-        save_done = pipeline_source.index("emit_stage_progress('save', page_key)")
+        self.assertIn('V4RenderSupervisor', pipeline_source)
+        self.assertNotIn('BlockingQueuedConnection', pipeline_source)
+        self.assertNotIn('_v4_gui_invoke_lock', pipeline_source)
+
+        worker_source = inspect.getsource(worker_mod._render_request)
+        layout_done = worker_source.index('"type": "layout_complete"')
+        image_save = worker_source.index('image.save(')
+        save_done = worker_source.index('"type": "save_complete"')
         self.assertLess(layout_done, image_save)
         self.assertLess(image_save, save_done)
 
@@ -200,6 +229,18 @@ class V4LayoutPipelineTests(unittest.TestCase):
             'updateTranslateProgress',
             inspect.getsource(layout_mod.UIHelper),
         )
+
+        mainwindow_source = Path('ui/mainwindow.py').read_text(encoding='utf-8')
+        mainwindow_tree = ast.parse(mainwindow_source)
+        gui_prepare_node = next(
+            node
+            for node in ast.walk(mainwindow_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == 'on_v4_prepare_page'
+        )
+        gui_prepare_source = ast.get_source_segment(mainwindow_source, gui_prepare_node)
+        self.assertIn('_prepare_page_translation_output', gui_prepare_source)
+        self.assertNotIn('updateCanvas', gui_prepare_source)
+        self.assertNotIn('.save(', gui_prepare_source)
 
     def test_stop_click_is_processed_while_render_waits_for_project_lock(self):
         project_lock = threading.Lock()

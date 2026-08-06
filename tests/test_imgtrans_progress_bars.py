@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -9,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qtpy.QtWidgets import QApplication
 
 from ui.custom_widget.message import ImgtransProgressMessageBox
+from ui.module_manager import ModuleManager
 
 
 class ImgtransProgressBarTests(unittest.TestCase):
@@ -91,6 +93,33 @@ class ImgtransProgressBarTests(unittest.TestCase):
         self.box.setV4BarsVisible(False)
         self.assertFalse(self.box.layout_bar.isVisible())
         self.assertFalse(self.box.saving_bar.isVisible())
+
+    def test_v4_progress_does_not_queue_legacy_page_refreshes(self):
+        manager = ModuleManager(SimpleNamespace())
+        manager.translate_thread = SimpleNamespace(
+            translator=SimpleNamespace(use_image_batching=True),
+        )
+        manager.imgtrans_thread = SimpleNamespace(
+            num_pages=1407,
+            recent_finished_index=lambda progress: progress - 1,
+        )
+        manager.progress_msgbox = SimpleNamespace(
+            updateTranslateProgress=lambda progress: None,
+        )
+        manager.finishImgtransPipeline = lambda: None
+        manager.last_finished_index = -1
+        refreshed_pages = []
+        manager.page_trans_finished.connect(refreshed_pages.append)
+
+        for progress in range(1, 1408):
+            manager.on_update_translate_progress(progress)
+
+        self.assertEqual(refreshed_pages, [])
+
+        manager.translate_thread.translator.use_image_batching = False
+        manager.on_update_translate_progress(1)
+        self.assertEqual(refreshed_pages, [0])
+        manager.deleteLater()
 
 
 if __name__ == '__main__':

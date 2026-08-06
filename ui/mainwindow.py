@@ -361,6 +361,7 @@ class MainWindow(mainwindow_cls):
         module_manager.finish_translate_page.connect(self.finishTranslatePage)
         module_manager.imgtrans_pipeline_finished.connect(self.on_imgtrans_pipeline_finished)
         module_manager.page_trans_finished.connect(self.on_pagtrans_finished)
+        module_manager.v4_prepare_page.connect(self.on_v4_prepare_page)
         module_manager.setupThread(self.configPanel, self.imgtrans_progress_msgbox, self.ocr_postprocess, self.translate_preprocess, self.translate_postprocess)
         module_manager.progress_msgbox.showed.connect(self.on_imgtrans_progressbox_showed)
         module_manager.blktrans_pipeline_finished.connect(self.on_blktrans_finished)
@@ -1421,7 +1422,7 @@ class MainWindow(mainwindow_cls):
             if pcfg.let_uppercase_flag:
                 blk.translation = blk.translation.upper()
 
-    def on_pagtrans_finished(self, page_index: int):
+    def _prepare_page_translation_output(self, page_index: int):
         blk_list = self.imgtrans_proj.get_blklist_byidx(page_index)
         ffmt_list = None
         if len(self.backup_blkstyles) == self.imgtrans_proj.num_pages and len(self.backup_blkstyles[page_index]) == len(blk_list):
@@ -1489,7 +1490,23 @@ class MainWindow(mainwindow_cls):
 
             self.st_manager.auto_textlayout_flag = pcfg.let_autolayout_flag and \
                 (pcfg.module.enable_detect or pcfg.module.enable_translate)
-        
+
+    def on_v4_prepare_page(self, page_key: str):
+        """Apply text/style settings needed by V4 without canvas work or saving."""
+        page_index = self.imgtrans_proj._pagename2idx.get(page_key)
+        if page_index is None:
+            LOGGER.error(f'V4 GUI preparation page not found: {page_key}')
+            return
+        save_lock = getattr(self.imgtrans_proj, '_v4_save_lock', None)
+        if save_lock is None:
+            self._prepare_page_translation_output(page_index)
+        else:
+            with save_lock:
+                self._prepare_page_translation_output(page_index)
+
+    def on_pagtrans_finished(self, page_index: int):
+        self._prepare_page_translation_output(page_index)
+
         # CRITICAL FIX for parallel translation:
         # Always switch to the completed page, update scene, and save
         # This ensures result images are saved with translations
